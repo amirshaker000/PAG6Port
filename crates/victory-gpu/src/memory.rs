@@ -38,7 +38,7 @@
 //! memory module of the layer knows and this one does not ask yet.
 //!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
-//! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
+//! there are at most [`copies`] of them (4 MiB windows mostly: 4 GiB at
 //! most). Every dispatch of such a shader brings all numbered copies up to
 //! date and, if it can store, declares all of them written (the bytes are
 //! compared on the CPU afterwards, as for any unordered access view): a
@@ -56,7 +56,20 @@ use crate::shadow::Shadow;
 
 /// Copies that can be numbered (the run of heap slots is one longer). A
 /// listed frame of the opening cutscene names about 50 windows.
-const COPIES: u32 = 1023;
+/// Flamingo: at most this many numbered copies (`VICTORY_MEMORY_COPIES`,
+/// 1023 by default, at most 16383). With the structure builder on, 1023 ran
+/// out within two minutes (run 122) and 4095 did not (run 123); without it,
+/// 4095 took the frame from 95 to 105-110 ms and broke the picture in three
+/// runs of three (126-128: every copy is brought up to date for each list).
+fn copies() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_MEMORY_COPIES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(1023, |n| n.clamp(1, 16383))
+    })
+}
 /// Frames before a retired copy's place is given to another copy.
 const REUSE_FRAMES: u64 = 4;
 /// A window of memory outside buffers (`shadow.rs`).
@@ -83,6 +96,8 @@ struct Memory {
     free: std::collections::VecDeque<(usize, u64)>,
     /// Flamingo: places given a copy since [`ready`] last looked.
     assigned: Vec<usize>,
+    /// Flamingo: the addresses the dispatch being made ready names.
+    named: Vec<u64>,
     /// Per host view heap (by address): the first slot of its run, and per
     /// copy's place the generation of the view there (0: none yet).
     heaps: HashMap<usize, (u32, Vec<u32>)>,
@@ -127,6 +142,7 @@ impl Memory {
             generation: Vec::new(),
             free: Default::default(),
             assigned: Vec::new(),
+            named: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -178,7 +194,7 @@ impl Memory {
             .map(|&(n, _)| n);
         let n = match self.copies.iter().zip(&self.live).position(|(c, &live)| live && Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
-            None if reusable.is_some() || self.copies.len() < COPIES as usize => {
+            None if reusable.is_some() || self.copies.len() < copies() as usize => {
                 let n = match reusable {
                     Some(n) => {
                         self.free.pop_front();
@@ -218,7 +234,7 @@ impl Memory {
             None => {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
+                    tracing::warn!(copies = copies(), "title memory by address: no number left for another copy; its pages read zeros")
                 });
                 return;
             }
@@ -302,7 +318,34 @@ impl Memory {
     fn name(&mut self, address: u64) {
         self.map(address);
         self.map((address & !(CELL - 1)) + CELL);
+        self.named.push(address);
+        self.named.push((address & !(CELL - 1)) + CELL);
     }
+
+    /// Flamingo: the place of the copy the directory gives `address`, if
+    /// it has one.
+    fn place_of(&self, address: u64) -> Option<usize> {
+        let page = address / PAGE;
+        if page >= u64::from(MEMORY_PAGES) - 1 {
+            return None;
+        }
+        // SAFETY: inside the directory's mapping.
+        let n = unsafe { self.directory.1.add(page as usize * 2).read_volatile() };
+        (n != 0).then(|| n as usize - 1)
+    }
+}
+
+/// Flamingo: whether a dispatch that can store by address declares every
+/// numbered copy written (the default), or only the copies of the memory it
+/// names, its root views and the addresses in its root constants
+/// (`VICTORY_BVH_WRITE_ALL=0`). Every copy, compared on the CPU after each
+/// list that stores, is slow: 0.9 fps with 4095 copies (run 124, no crash
+/// in 400 s). The named copies alone made 3.0 fps, but the title then read
+/// a wild pointer 98 s into the builder (run 125): what it reads back must
+/// be all of what the stages wrote, or none of it (`VICTORY_BVH_QUARANTINE`).
+fn write_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_WRITE_ALL").is_none_or(|v| v != "0"))
 }
 
 /// Before a draw whose shader reads title memory by address: what its
@@ -330,6 +373,7 @@ pub(crate) fn ready(
         m.forget_stale();
         m.take_faults();
     }
+    m.named.clear();
     for &address in addresses {
         m.name(address);
     }
@@ -352,7 +396,7 @@ pub(crate) fn ready(
         Some(run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
+            let base = heap.dynamic(copies() + 1)?;
             heap.null_raw_uav_at(base);
             (base, Vec::new())
         }
@@ -367,12 +411,21 @@ pub(crate) fn ready(
     }
     m.heaps.insert(key, (base, shown));
     let assigned = std::mem::take(&mut m.assigned);
+    let named: Vec<usize> = if writes && !write_all() {
+        let mut places: Vec<usize> = m.named.iter().filter_map(|&a| m.place_of(a)).collect();
+        places.sort_unstable();
+        places.dedup();
+        places
+    } else {
+        Vec::new()
+    };
     // Once per list, and for copies numbered since: the builder alone
     // dispatches hundreds of times a frame.
     // shortcut: a copy another list numbers meanwhile is brought up to date
     // by that list's submission, which may run after this one's.
     const READ: usize = usize::MAX - 0x6d;
     const WRITE: usize = usize::MAX - 0x6e;
+    const NAMED_WRITE: usize = usize::MAX - 0x10_0000;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
     for (n, shadow) in m.copies.iter().enumerate() {
@@ -385,7 +438,12 @@ pub(crate) fn ready(
         if first_read || new {
             shadow.refresh(list, start, len);
         }
-        if writes && (first_write || new) {
+        if writes && write_all() && (first_write || new) {
+            shadow.gpu_writes(list, start, len);
+        }
+        // Once per list for each copy named (keys far below the other
+        // `first_use` keys near `usize::MAX`).
+        if writes && !write_all() && named.binary_search(&n).is_ok() && list.first_use(NAMED_WRITE - n) {
             shadow.gpu_writes(list, start, len);
         }
     }
