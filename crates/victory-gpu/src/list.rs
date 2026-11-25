@@ -118,7 +118,12 @@ struct List {
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
-    state: std::sync::Mutex<crate::draw::State>,
+    /// The draw state the title set. The title records one list on one
+    /// thread at a time and submits it only after recording ends, so no
+    /// other thread can hold this while the recorder runs (DexNom/VIctory
+    /// #27, Belobug/VIctory-Belobug-AMD #145; they measured the title's
+    /// five recording threads taking turns on this lock).
+    state: std::cell::UnsafeCell<crate::draw::State>,
     /// The parts of the recording before `host`, in order, each closed: the
     /// list is cut at its waits for memory values ([`cut`]).
     #[cfg(windows)]
@@ -146,9 +151,10 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the title passes one of our lists.
-    let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    // SAFETY: the title passes one of our lists, and records it on one
+    // thread that submits only after recording ends (see `state`).
+    let state = unsafe { &mut *(*this.cast::<List>()).state.get() };
+    f(list, state);
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
     #[cfg(feature = "diagnostics")]
@@ -166,8 +172,10 @@ pub(crate) fn tables_done(lists: &[This]) {
         }
         // SAFETY: the title passes our lists.
         let list = unsafe { &*this.cast::<List>() };
+        // SAFETY: the title passes our lists, and only the recorder touches
+        // `state` while a list records (see `state`).
         if list.earlier.is_empty() {
-            list.state.lock().unwrap_or_else(|e| e.into_inner()).tables_done();
+            unsafe { &mut *list.state.get() }.tables_done();
         }
     }
 }
@@ -336,10 +344,8 @@ fn cut(this: This, wait: ValueWait) {
     }
     // What the title set so far, on the new host list.
     if let Some(host) = list.host.as_ref() {
-        list.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .replay(host);
+        // SAFETY: this list records on one thread (see `state`).
+        unsafe { &mut *list.state.get() }.replay(host);
     }
 }
 
@@ -409,7 +415,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
-        let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
+        let state = std::mem::take(unsafe { &mut *list.state.get() });
         let single = earlier.is_empty() && gate.is_empty();
         let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
             .into_iter()
@@ -482,7 +488,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state =
-                std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
+                std::mem::take(unsafe { &mut *(*list).state.get() });
             (host, uploads, state)
         };
         order.push(taken.len());
@@ -590,7 +596,7 @@ fn new_list(
         state: {
             let mut state = crate::draw::State::default();
             state.set_pipeline(pipeline);
-            std::sync::Mutex::new(state)
+            std::cell::UnsafeCell::new(state)
         },
         #[cfg(windows)]
         earlier: Vec::new(),
@@ -2086,10 +2092,8 @@ fn value_written(this: This, address: u64, value: u64) {
             list.earlier.push(Part { waits, host: done });
         }
         if let Some(host) = list.host.as_ref() {
-            list.state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .replay(host);
+            // SAFETY: this list records on one thread (see `state`).
+            unsafe { &mut *list.state.get() }.replay(host);
         }
     }
     #[cfg(not(windows))]
