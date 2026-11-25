@@ -335,99 +335,17 @@ impl Memory {
     }
 }
 
-/// A list with this key ([`HostList::used`]) asks the builder for sizes.
-const SIZES: usize = usize::MAX - (9 << 33);
-
-/// Whether a submission that asks for the sizes of structures is waited for,
-/// and landed, before the title goes on (`VICTORY_BVH_SIZES_WAIT=1`; off).
-///
-/// Off: it does not help. In run light-15, with it, 33 of 154 copies had the
-/// slot's old size still (all of them recorded one frame after the size was
-/// asked for) against 53 of 230 in light-11, 48 of 275 dynamic structures
-/// were good, and the title asks in every frame, so every frame waits (109 ms
-/// against 90). The title reads the slot before our submission of the asking
-/// list is through, or reads it for another purpose; not known.
-///
-/// The title asks for a new structure's compacted size (a program of one
-/// thread stores it into a small buffer), reads it a frame or two later
-/// without looking whether it is there, takes memory of that size and copies
-/// the structure into it. With submissions that land up to two frames late it
-/// read what the slot held before, some other structure's size, and the copy
-/// wrote over its neighbours: of 230 such copies of run light-11, 99 were
-/// asked for two frames earlier and landed in that frame, none of those with
-/// the right size.
-fn sizes_wait() -> bool {
+/// Flamingo: whether a dispatch that can store by address declares every
+/// numbered copy written (the default), or only the copies of the memory it
+/// names, its root views and the addresses in its root constants
+/// (`VICTORY_BVH_WRITE_ALL=0`). Every copy, compared on the CPU after each
+/// list that stores, is slow: 0.9 fps with 4095 copies (run 124, no crash
+/// in 400 s). The named copies alone made 3.0 fps, but the title then read
+/// a wild pointer 98 s into the builder (run 125): what it reads back must
+/// be all of what the stages wrote, or none of it (`VICTORY_BVH_QUARANTINE`).
+fn write_all() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_SIZES_WAIT").is_some_and(|v| v == "1"))
-}
-
-/// Whether a dispatch of the builder is its program of a structure's size:
-/// one thread, the structure's address and what to store (1: the compacted
-/// size) as constants, a small title buffer to store into.
-fn asks_size(written: &[u64], constants: &[u32], threads: Option<[u32; 3]>) -> bool {
-    threads == Some([1, 1, 1])
-        && matches!(*constants, [_, hi, 1..=3, ..] if (1..0x20).contains(&hi))
-        && written.first().is_some_and(|&at| crate::shadow::in_buffer(at, 1).is_some_and(|b| b.1 <= BACK))
-}
-
-/// Whether one of `lists` asks for sizes.
-pub(crate) fn asked_sizes<'a>(lists: impl Iterator<Item = &'a HostList>) -> bool {
-    let mut lists = lists;
-    let asked = sizes_wait() && lists.any(|l| l.used(SIZES));
-    if asked {
-        static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if n.is_power_of_two() || n.is_multiple_of(100) {
-            tracing::info!(n, frame = crate::frame::current(), "submissions that ask for structures' sizes, waited for");
-        }
-    }
-    asked
-}
-
-/// [`fill`] of a page stores by address do not reach.
-fn close(entry: *mut u32, n: usize, offset: u64) {
-    fill(entry, n | MEMORY_READ_ONLY as usize, offset);
-}
-
-/// The offset first: a shader that sees the number sees it too.
-fn fill(entry: *mut u32, n: usize, offset: u64) {
-    // SAFETY: an entry of the directory, under the mutex.
-    unsafe {
-        entry.add(1).write_volatile(offset as u32);
-        entry.write_volatile(n as u32 + 1);
-    }
-}
-
-/// The bytes of a packed structure whose first two dwords these are: the
-/// version (6) with the marks of a bottom level and of one that is packed,
-/// and its size unpacked in 64-byte nodes.
-fn packed_len(header: u64) -> Option<u64> {
-    let (version, nodes) = (header as u32, header >> 32);
-    let marks = version >> 16;
-    // The header counts its nodes of 64 bytes without the last one: the
-    // builder's own program of a structure's size stores one more.
-    let len = (nodes + 1) * 64;
-    (version & 0xFFFF == 6 && marks & 0x8100 == 0x8100 && nodes > 0 && len <= PACKED).then_some(len)
-}
-
-/// Puts what `title` holds into `ours` (what was last taken): the dwords that
-/// differ. How many.
-fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
-    if never {
-        ours.copy_from_slice(title);
-        return PIECE / 4;
-    }
-    if ours == title {
-        return 0;
-    }
-    let mut changed = 0;
-    for (t, o) in title.chunks_exact(4).zip(ours.chunks_exact_mut(4)) {
-        if t != o {
-            o.copy_from_slice(t);
-            changed += 1;
-        }
-    }
-    changed
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_WRITE_ALL").is_none_or(|v| v != "0"))
 }
 
 /// Before a draw whose shader reads title memory by address: what its
