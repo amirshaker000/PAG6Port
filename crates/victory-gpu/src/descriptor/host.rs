@@ -53,6 +53,11 @@ pub(crate) struct HostHeap {
     /// 45), under the lock all of them need. (A free run that lies across
     /// the place the search starts from is seen by neither.)
     too_long: std::sync::atomic::AtomicU32,
+    /// The smallest table size a search found no free run for since the
+    /// last release: searches of that size or more are refused at once
+    /// (each failed walk of a frame that does not fit otherwise walks all
+    /// the slots, seconds a frame on a heavy place). Cleared on release.
+    no_run: std::sync::atomic::AtomicU32,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -987,6 +992,7 @@ impl HostHeap {
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+            no_run: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
             changed: Mutex::default(),
@@ -1094,8 +1100,31 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
+        // A search that found no run of this size (or of a smaller one)
+        // since the last release finds none now: without this, each table
+        // of a frame that does not fit walked all the slots again, and a
+        // heavy place took 7 to 11 seconds a frame (runs sw1, sw2).
+        let no_run = self.no_run.load(std::sync::atomic::Ordering::Relaxed);
+        if n as u32 >= no_run {
+            return None;
+        }
+        // Releases come all the time and each allows a search again: no
+        // more than a few failed walks a frame.
+        static FAILED: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+        const WALKS: u64 = 8;
+        let frame = crate::queue::presented();
+        if FAILED[0].swap(frame, std::sync::atomic::Ordering::Relaxed) != frame {
+            FAILED[1].store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        if FAILED[1].load(std::sync::atomic::Ordering::Relaxed) >= WALKS {
+            return None;
+        }
+        // Search from `next` on, then from the start (extending past cursor by
+        // n - 1 so contiguous runs crossing the cursor are not missed).
+        let cursor = *next as usize;
+        let spare = taken.len();
+        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(spare);
+        let starts = (cursor..spare).chain(0..second_end);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -1114,6 +1143,7 @@ impl HostHeap {
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
+                self.no_run.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
@@ -1724,6 +1754,7 @@ impl HostHeap {
             let given = slots.iter().filter(|taken| **taken).count() as u32;
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+            self.no_run.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
             slots.fill(false);
         }
     }
@@ -3943,5 +3974,26 @@ mod own_copy_tests {
         assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true), None);
         assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
+    }
+
+    /// A free run that starts before the place the search goes on from and
+    /// ends after it is found: the search from the start goes on past that
+    /// place by the run's length less one. It was not, so the only run of
+    /// 20 below was missed, and tables of 20 or more were not made until
+    /// the next release.
+    #[test]
+    fn a_free_run_across_the_search_start_is_found() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let spare = heap.spare;
+        // [0, 50) and [50, spare - 10): the search goes on at spare - 10,
+        // and the last 10 slots were never taken.
+        let a = heap.dynamic(50).unwrap();
+        let b = heap.dynamic(spare - 60).unwrap();
+        assert_eq!((a, b), (4, 4 + 50));
+        // [spare - 20, spare - 10) given back: one run of 20, across it.
+        heap.release(b + spare - 70, 10);
+        assert_eq!(heap.dynamic(20), Some(4 + spare - 20));
     }
 }
