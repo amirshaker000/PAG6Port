@@ -1,9 +1,10 @@
 //! The mouse as the pad's right stick (from XCL's `kbm.rs`, `crates/xcl/src/hle/`):
-//! raw input counts go in through the hooked window procedure, and the
-//! smoothed velocity becomes a stick deflection each frame, winning over the
-//! pad's own stick while it moves. The cursor is held at the window's centre
-//! while the title has the focus (`Alt+Tab` frees it). Off unless
-//! `VICTORY_MOUSE=1`.
+//! each frame reads the cursor, takes its offset from the window's centre as
+//! the movement of that frame, and puts the cursor back at the centre. The
+//! smoothed velocity becomes a stick deflection, winning over the pad's own
+//! stick while it moves. No hooks and no raw input: the cursor can only
+//! leave the centre when the title lacks the focus, which is exactly when
+//! the mouse must do nothing. Off unless `VICTORY_MOUSE=1`.
 //!
 //! | PC | pad |
 //! |---|---|
@@ -14,7 +15,7 @@
 
 #![allow(non_snake_case)]
 
-use std::sync::atomic::{AtomicIsize, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -54,45 +55,12 @@ impl Velocity {
 }
 
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
-static DX: AtomicI32 = AtomicI32::new(0);
-static DY: AtomicI32 = AtomicI32::new(0);
-static CAPTURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static STATE: Mutex<Option<Velocity>> = Mutex::new(None);
-
-const WM_INPUT: u32 = 0x00FF;
-const WM_ACTIVATE: u32 = 0x0021;
-const RID_INPUT: u32 = 0x10000005;
-const RIM_TYPEMOUSE: u32 = 0;
-const MOUSE_MOVE_ABSOLUTE: u32 = 0x0001;
-
-#[repr(C)]
-struct RawInputDevice {
-    usage_page: u16,
-    usage: u16,
-    flags: u32,
-    target: *mut core::ffi::c_void,
-}
+static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+static FEEDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[repr(C)]
 #[derive(Default)]
-struct RawMouseInput {
-    /// RAWINPUTHEADER: (DWORD dwType, DWORD dwSize, HANDLE hDevice,
-    /// WPARAM wParam) - `dwType` is the FIRST dword (0: mouse).
-    header: [u32; 8],
-    /// RAWMOUSE: usFlags.
-    flags: u32,
-    /// usButtonFlags, usButtonData.
-    button_flags: u16,
-    button_data: u16,
-    raw_buttons: u32,
-    /// lLastX, lLastY.
-    last_x: i32,
-    last_y: i32,
-    extra: [u32; 5],
-}
-
-#[repr(C)]
 struct Rect {
     left: i32,
     top: i32,
@@ -101,6 +69,7 @@ struct Rect {
 }
 
 #[repr(C)]
+#[derive(Default)]
 struct Point {
     x: i32,
     y: i32,
@@ -108,11 +77,10 @@ struct Point {
 
 #[link(name = "user32")]
 unsafe extern "system" {
-    fn RegisterRawInputDevices(devices: *const RawInputDevice, n: u32, size: u32) -> i32;
-    fn GetRawInputData(input: isize, command: u32, data: *mut core::ffi::c_void, size: *mut u32, header: u32) -> u32;
-    fn ClipCursor(rect: *const Rect) -> i32;
     fn GetClientRect(hwnd: *mut core::ffi::c_void, rect: *mut Rect) -> i32;
     fn ClientToScreen(hwnd: *mut core::ffi::c_void, point: *mut Point) -> i32;
+    fn GetCursorPos(point: *mut Point) -> i32;
+    fn SetCursorPos(x: i32, y: i32) -> i32;
     fn GetForegroundWindow() -> *mut core::ffi::c_void;
 }
 
@@ -120,81 +88,25 @@ pub(crate) fn enabled() -> bool {
     std::env::var_os("VICTORY_MOUSE").is_some_and(|v| v != "0")
 }
 
-/// The title's window is up: raw mouse input reports to it.
+/// The title's window is up: the mouse reports to it.
 pub(crate) fn attach(hwnd: *mut core::ffi::c_void) {
     if !enabled() {
         return;
     }
     WINDOW.store(hwnd as isize, Ordering::Release);
-    // Generic desktop mouse.
-    let dev = RawInputDevice { usage_page: 1, usage: 2, flags: 0, target: hwnd };
-    let ok = unsafe { RegisterRawInputDevices(&dev, 1, std::mem::size_of::<RawInputDevice>() as u32) } != 0;
-    REGISTERED.store(ok, Ordering::Release);
-    tracing::info!(
-        "the mouse is the pad's right stick (left button right trigger, right button left trigger){}",
-        if ok { "" } else { " - raw input was refused: the mouse is not read" }
-    );
+    tracing::info!("the mouse is the pad's right stick (left button right trigger, right button left trigger)");
 }
 
-/// The cursor is held at the window's centre while `on`, freed otherwise.
-fn hold_cursor(hwnd: *mut core::ffi::c_void, on: bool) {
-    if !on {
-        if CAPTURED.swap(false, Ordering::AcqRel) {
-            unsafe { ClipCursor(std::ptr::null()) };
-        }
-        return;
-    }
-    // A point at the client area's centre: the cursor stays there, hidden.
-    let mut r = Rect { left: 0, top: 0, right: 0, bottom: 0 };
-    unsafe { GetClientRect(hwnd, &mut r) };
-    let mut c = Point { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 };
-    unsafe { ClientToScreen(hwnd, &mut c) };
-    let at = Rect { left: c.x, top: c.y, right: c.x + 1, bottom: c.y + 1 };
-    unsafe { ClipCursor(&at) };
-    CAPTURED.store(true, Ordering::Release);
-}
-
-/// The window procedure's messages: `true` when handled (the caller returns 0).
-pub(crate) fn on_message(hwnd: isize, message: u32, wparam: usize, lparam: isize) -> bool {
-    if WINDOW.load(Ordering::Acquire) != hwnd || !REGISTERED.load(Ordering::Acquire) {
-        return false;
-    }
-    match message {
-        WM_INPUT => {
-            let mut raw = RawMouseInput::default();
-            let mut size = std::mem::size_of::<RawMouseInput>() as u32;
-            // SAFETY: `lparam` is a HRAWINPUT of this thread's message, and
-            // the buffer holds the header the size asked for.
-            let n = unsafe {
-                GetRawInputData(lparam, RID_INPUT, &mut raw as *mut _ as *mut core::ffi::c_void, &mut size, 24)
-            };
-            if n != u32::MAX
-                && raw.header[0] == RIM_TYPEMOUSE
-                && CAPTURED.load(Ordering::Acquire)
-                && raw.flags & MOUSE_MOVE_ABSOLUTE == 0
-            {
-                DX.fetch_add(raw.last_x, Ordering::Relaxed);
-                DY.fetch_add(raw.last_y, Ordering::Relaxed);
-            }
-            false
-        }
-        WM_ACTIVATE => {
-            let active = wparam & 0xFFFF != 0;
-            hold_cursor(hwnd as *mut core::ffi::c_void, active);
-            if !active {
-                DX.store(0, Ordering::Relaxed);
-                DY.store(0, Ordering::Relaxed);
-            }
-            false
-        }
-        _ => false,
-    }
+/// The window procedure's messages: nothing needed any more, the stick is
+/// polled each frame; kept so the wiring holds.
+pub(crate) fn on_message(_hwnd: isize, _message: u32, _wparam: usize, _lparam: isize) -> bool {
+    false
 }
 
 /// The mouse's right stick for this frame, on top of `pad`'s own while it
-/// moves: the smoothed velocity of the counts since the last call. The
-/// buttons are set on `pad` too. Nothing while the window lacks focus or
-/// `VICTORY_MOUSE` is unset.
+/// moves: the cursor's offset from the window's centre, put back at the
+/// centre. The buttons are set on `pad` too. Nothing while the window lacks
+/// focus or `VICTORY_MOUSE` is unset.
 pub(crate) fn apply(pad: &mut super::gameinput::PadState) {
     if !enabled() {
         return;
@@ -203,15 +115,33 @@ pub(crate) fn apply(pad: &mut super::gameinput::PadState) {
     if hwnd == 0 || unsafe { GetForegroundWindow() } as isize != hwnd {
         return;
     }
+    let hwnd = hwnd as *mut core::ffi::c_void;
+    let mut r = Rect::default();
+    if unsafe { GetClientRect(hwnd, &mut r) } == 0 {
+        return;
+    }
+    let mut c = Point { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 };
+    unsafe { ClientToScreen(hwnd, &mut c) };
+    let mut p = Point::default();
+    if unsafe { GetCursorPos(&mut p) } == 0 {
+        return;
+    }
+    let dx = p.x - c.x;
+    let dy = p.y - c.y;
+    // The cursor goes back to the centre whether it moved or not: a move of
+    // zero keeps it pinned there.
+    unsafe { SetCursorPos(c.x, c.y) };
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let mut velocity = g.take().unwrap_or_default();
     let now = Instant::now();
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let dt = last.map(|l| now.duration_since(l).as_secs_f32()).unwrap_or(0.016);
     *last = Some(now);
-    velocity.update(DX.swap(0, Ordering::Relaxed), DY.swap(0, Ordering::Relaxed), dt);
+    velocity.update(dx, dy, dt);
     *g = Some(velocity);
+    if !FEEDING.swap(dx != 0 || dy != 0, Ordering::Relaxed) && (dx != 0 || dy != 0) {
+        tracing::info!("the mouse feeds the stick now (dx={dx}, dy={dy})");
+    }
     let (rx, ry) = stick_from_mouse(velocity.x, velocity.y);
     if (rx != 0.0 || ry != 0.0) && rx * rx + ry * ry >= pad.right_x * pad.right_x + pad.right_y * pad.right_y {
         pad.right_x = rx;
@@ -253,5 +183,16 @@ mod tests {
         let (x, y) = stick_from_mouse(0.0, -1000.0);
         assert_eq!(x, 0.0);
         assert!(y > 0.0, "up on screen is stick up: {y}");
+    }
+
+    #[test]
+    fn the_velocity_decays_to_rest() {
+        let mut v = Velocity::default();
+        v.update(400, 0, 0.016);
+        let fast = v.x;
+        for _ in 0..60 {
+            v.update(0, 0, 0.016);
+        }
+        assert!(v.x < fast * 0.01, "{} -> {}", fast, v.x);
     }
 }
