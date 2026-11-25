@@ -443,14 +443,9 @@ fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
-            // With RenderDoc loaded the device is RenderDoc's: the card's
             // library is not for it, and what it would save is not for
             // the card. Neither read nor written in such a run.
             #[cfg(feature = "diagnostics")]
-            if crate::renderdoc::loaded() {
-                tracing::info!("RenderDoc is loaded: the host pipeline library is neither read nor saved in this run");
-                return None;
-            }
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
@@ -503,7 +498,6 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     drop(blob);
     // And the file is kept under another name, not written over by this
     // run's first save: a refusal may be this device's alone (run 263:
-    // RenderDoc's device refused the card's library, an empty one was
     // saved over 366 MB of built pipelines, and the next run drew black
     // until they were built again).
     if rejected && let Some(dir) = DIR.get() {

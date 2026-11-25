@@ -118,39 +118,19 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
-    /// `FILE_FLAG_NO_BUFFERING`: the drive reads straight into our buffer,
-    /// with no file cache in the way.
-    const NO_BUFFERING: u32 = 0x2000_0000;
     if path.is_null() {
         return E_INVALIDARG;
     }
     // Goes through `files`, so paths on our virtual drives work too.
-    // `VICTORY_DSTORAGE_UNBUFFERED=0` reads through the cache, as before.
-    let unbuffered = std::env::var_os("VICTORY_DSTORAGE_UNBUFFERED").is_none_or(|v| v != "0");
-    let mut handle = super::files::CreateFileW(
+    let handle = super::files::CreateFileW(
         path,
         GENERIC_READ,
         FILE_SHARE_READ,
         std::ptr::null(),
         OPEN_EXISTING,
-        if unbuffered { NO_BUFFERING } else { 0 },
+        0,
         std::ptr::null_mut(),
     );
-    let mut unbuffered = unbuffered && handle as isize != -1;
-    if handle as isize == -1 && unbuffered {
-        // A path the flag is refused for (a device, an emulated drive):
-        // open it as before.
-        handle = super::files::CreateFileW(
-            path,
-            GENERIC_READ,
-            FILE_SHARE_READ,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        );
-        unbuffered = false;
-    }
     // SAFETY: the title passes a NUL-terminated path.
     let name = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
@@ -165,7 +145,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, unbuffered });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
     WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
@@ -280,9 +260,6 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
-    /// Opened with `FILE_FLAG_NO_BUFFERING`: every read must be a whole
-    /// number of sectors, in a buffer aligned to one ([`read_uncached`]).
-    unbuffered: bool,
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -391,9 +368,6 @@ struct Lane {
     clock: u64,
     /// Enqueued, not yet submitted.
     unsubmitted: Vec<Command>,
-    /// Left out when the queue submitted itself, until the title's Submit:
-    /// reads into physical pages and the status entries behind them.
-    held: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
     reads: VecDeque<(u64, QueuedRead)>,
@@ -419,73 +393,6 @@ struct Job {
 // SAFETY: as for `Lane`.
 unsafe impl Send for Job {}
 
-/// How many storage workers run at once. The pool reads, inflates and unpacks
-/// in parallel, so the useful count is the PC's **physical** cores: logical
-/// processors count SMT twins, which add little to a pool that already
-/// oversubscribes the cores the submitting thread and the copies need. One
-/// 8-core/16-thread laptop ran 16 workers and had the submitting thread
-/// waiting behind them; 8 measured `copying back` at 2.4-3.5 ms/MB against
-/// 5.7 ms/MB with 16. `VICTORY_DSTORAGE_WORKERS` sets the count outright.
-fn worker_count() -> usize {
-    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *COUNT.get_or_init(|| {
-        if let Some(n) = std::env::var("VICTORY_DSTORAGE_WORKERS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|n| (1..=64).contains(n))
-        {
-            return n;
-        }
-        let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
-        physical_cores().unwrap_or_else(|| (logical / 2).max(2)).clamp(1, 32)
-    })
-}
-
-/// The PC's physical cores, if the system will say so (`RelationProcessorCore`
-/// returns one record per core, whatever its SMT twins are).
-#[cfg(windows)]
-fn physical_cores() -> Option<usize> {
-    use windows_sys::Win32::System::SystemInformation::{
-        GetLogicalProcessorInformationEx, RelationProcessorCore,
-        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
-    };
-    let mut len: u32 = 0;
-    // SAFETY: a null buffer asks for the size; the call fails with
-    // ERROR_INSUFFICIENT_BUFFER and fills `len`.
-    unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut len) };
-    if len == 0 {
-        return None;
-    }
-    let mut buf = vec![0u8; len as usize];
-    // SAFETY: the buffer is `len` bytes and the call writes at most that.
-    let ok = unsafe {
-        GetLogicalProcessorInformationEx(
-            RelationProcessorCore,
-            buf.as_mut_ptr().cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(),
-            &mut len,
-        )
-    };
-    if ok == 0 {
-        return None;
-    }
-    let mut at = 0usize;
-    let mut cores = 0usize;
-    while at + 8 <= buf.len() {
-        // SAFETY: the record's own header; `Size` is its first field.
-        let size = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(at).cast::<u32>()) } as usize;
-        if size < 8 || at + size > buf.len() {
-            break;
-        }
-        cores += 1;
-        at += size;
-    }
-    (cores > 0).then_some(cores)
-}
-
-#[cfg(not(windows))]
-fn physical_cores() -> Option<usize> {
-    None
-}
 /// The scheduler, with its workers started on first use; `None` if not
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
@@ -515,7 +422,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = worker_count();
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -702,20 +609,8 @@ impl Lanes {
         }
     }
 
-    /// Moves a queue's enqueued commands to the workers (the title's
-    /// Submit).
+    /// Moves a queue's enqueued commands to the workers.
     fn submit(&mut self, id: u64) {
-        self.submit_as(id, true);
-    }
-
-    /// As [`Lanes::submit`]; `explicit` false when a half-full queue submits
-    /// itself, which leaves reads into physical pages for the title's
-    /// Submit: their page lists point into the title's page table, which
-    /// The title fills for the batch in its own submit path, right
-    /// before Submit (`sub_1400e88f0`), so until then they name no page or a
-    /// page that now holds something else. A status entry behind a held
-    /// read waits with it.
-    fn submit_as(&mut self, id: u64, explicit: bool) {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return;
         };
@@ -734,18 +629,7 @@ impl Lanes {
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
-        let mut commands = if explicit { std::mem::take(&mut lane.held) } else { Vec::new() };
-        commands.append(&mut lane.unsubmitted);
-        for command in commands {
-            let hold = !explicit
-                && match &command {
-                    Command::Read(r) => r.options & PAGE_DESTINATION != 0,
-                    Command::Status(_) => !lane.held.is_empty(),
-                };
-            if hold {
-                lane.held.push(command);
-                continue;
-            }
+        for command in std::mem::take(&mut lane.unsubmitted) {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
@@ -764,7 +648,6 @@ impl Lane {
             capacity: usize::from(capacity),
             clock: 0,
             unsubmitted: Vec::new(),
-            held: Vec::new(),
             reads: VecDeque::new(),
             statuses: VecDeque::new(),
             running: BTreeSet::new(),
@@ -775,11 +658,7 @@ impl Lane {
 
     /// Requests and status entries held, submitted or not.
     fn entries(&self) -> usize {
-        self.unsubmitted.len()
-            + self.held.len()
-            + self.reads.len()
-            + self.statuses.len()
-            + self.running.len()
+        self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
     }
 
     /// Writes the status entries whose earlier reads have all finished.
@@ -827,7 +706,6 @@ fn close_lane(id: u64) {
     };
     lane.closed = true;
     lane.unsubmitted.clear();
-    lane.held.clear();
     lane.reads.clear();
     lane.statuses.clear(); // releases their arrays
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
@@ -979,16 +857,6 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
-        // Full with reads held for a Submit the title cannot make while it
-        // waits here: they go now, page lists as they are.
-        if !lane.held.is_empty() {
-            static WARNED: AtomicBool = AtomicBool::new(false);
-            if !WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!("dstorage: a full queue's reads into physical pages start before the title's Submit");
-            }
-            lanes.submit(id);
-            scheduler.work.notify_all();
-        }
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -999,19 +867,8 @@ fn queue(this: QueueRef, command: Command) {
     };
     lane.unsubmitted.push(command);
     if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
-        let capacity = lane.capacity;
-        lanes.submit_as(id, false);
+        lanes.submit(id);
         scheduler.work.notify_all();
-        let held = lanes.lanes.get(&id).map_or(0, |l| l.held.len());
-        let n = AUTO_SUBMITS.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_power_of_two() {
-            tracing::info!(
-                n,
-                capacity,
-                held,
-                "dstorage: a queue half full submitted itself; reads into physical pages wait for the title's Submit"
-            );
-        }
     }
 }
 
@@ -1022,7 +879,7 @@ extern "system" fn submit(this: QueueRef) {
         return;
     };
     let mut lanes = scheduler.lock();
-    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len() + l.held.len());
+    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len());
     tracing::debug!(commands = pending, "dstorage: submit");
     lanes.submit(id);
     scheduler.work.notify_all();
@@ -1217,34 +1074,6 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
-/// A read of a file opened with `FILE_FLAG_NO_BUFFERING`: the drive takes
-/// whole sectors in a buffer aligned to one, so the request is widened to
-/// the sectors around it, read into an aligned buffer, and the wanted bytes
-/// are copied out. Returns how many bytes of `out` the file had.
-fn read_uncached(file: &std::fs::File, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
-    use std::os::windows::fs::FileExt;
-    const SECTOR: usize = 4096;
-    let start = offset & !(SECTOR as u64 - 1);
-    let delta = (offset - start) as usize;
-    let span = (delta + out.len()).div_ceil(SECTOR) * SECTOR;
-    // One sector of slack, so the read's buffer can start aligned inside it.
-    let mut raw = vec![0u8; span + SECTOR];
-    let skip = (SECTOR - (raw.as_ptr() as usize % SECTOR)) % SECTOR;
-    let buf = &mut raw[skip..skip + span];
-    let mut done = 0;
-    while done < span {
-        match file.seek_read(&mut buf[done..], start + done as u64) {
-            Ok(0) => break,
-            Ok(n) => done += n,
-            Err(error) if done == 0 => return Err(error),
-            Err(_) => break,
-        }
-    }
-    let available = done.saturating_sub(delta).min(out.len());
-    out[..available].copy_from_slice(&buf[delta..delta + available]);
-    Ok(available)
-}
-
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
@@ -1253,35 +1082,23 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
+    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
+        .state
+        .file;
     let started = std::time::Instant::now();
-    let result = if unbuffered(file) {
-        // No file cache between the drive and us.
-        match read_uncached(&file.file, request.offset, out) {
-            Ok(n) if n == out.len() => Ok(()),
-            Ok(_) => Err(END_OF_FILE),
-            Err(error) => Err(from_win32(&error)),
+    let mut done = 0;
+    let result = loop {
+        if done == out.len() {
+            break Ok(());
         }
-    } else {
-        let mut done = 0;
-        loop {
-            if done == out.len() {
-                break Ok(());
-            }
-            match file.file.seek_read(&mut out[done..], request.offset + done as u64) {
-                Ok(0) => break Err(END_OF_FILE),
-                Ok(n) => done += n,
-                Err(error) => break Err(from_win32(&error)),
-            }
+        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+            Ok(0) => break Err(END_OF_FILE),
+            Ok(n) => done += n,
+            Err(error) => break Err(from_win32(&error)),
         }
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
-}
-
-/// Whether `file` was opened without the file cache.
-fn unbuffered(file: &File) -> bool {
-    file.unbuffered
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1949,95 +1766,6 @@ mod tests {
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
         assert_eq!(seen, plain);
     }
-    #[test]
-    fn a_queue_that_submits_itself_holds_reads_into_pages() {
-        let mut l = lanes(STAGING);
-        l.lanes.insert(0, Lane::new(0, 64));
-        let array = status_array(1).cast::<Instance<StatusArray>>();
-        read(&mut l, 0, PAGE_DESTINATION, 16);
-        read(&mut l, 0, 0, 16);
-        add_ref_instance(array);
-        l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Status(Status { array, index: 0 }));
-        l.submit_as(0, false);
-        // Only the plain read starts; the status waits behind the held one.
-        let plain = l.start().unwrap();
-        assert_eq!(plain.request.options, 0);
-        assert!(l.start().is_none());
-        l.finish(&plain, Ok(()));
-        assert_eq!(l.lanes[&0].held.len(), 2);
-        l.submit(0);
-        let paged = l.start().unwrap();
-        assert_eq!(paged.request.options, PAGE_DESTINATION);
-        assert!(l.lanes[&0].held.is_empty());
-        assert!(!l.lanes[&0].statuses.is_empty());
-        l.finish(&paged, Ok(()));
-        assert!(l.lanes[&0].statuses.is_empty());
-    }
-
-    #[test]
-    fn a_page_list_the_title_changes_before_its_submit() {
-        use crate::modules::xmem;
-        let (mut given, mut pages) = (2usize, [0usize; 2]);
-        assert_eq!(
-            xmem::XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()),
-            1
-        );
-        let mapped = xmem::XMemVirtualAlloc(
-            std::ptr::null_mut(),
-            2 * PAGE,
-            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
-            0,
-            0x04,
-        );
-        assert!(!mapped.is_null());
-        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()), mapped);
-        // The title's page table: still the page's previous owner when the
-        // request is enqueued, the right page by its Submit.
-        let mut list = [pages[0]];
-        let plain = pattern(4096);
-        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
-            call(factory(), 0x50);
-        let desc = QueueDesc {
-            source_type: 0,
-            capacity: 4,
-            priority: 1,
-            name: c"pages".as_ptr(),
-            unknown: 1,
-        };
-        let mut queue = std::ptr::null_mut();
-        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
-        let array = status_array(1);
-        let r = request(
-            PAGE_DESTINATION | MEMORY_SOURCE,
-            list.as_mut_ptr().cast(),
-            plain.len(),
-            plain.as_ptr().cast(),
-            0,
-            plain.len(),
-        );
-        enqueue(queue, &r);
-        let mut out = [0u8; 16];
-        enqueue(queue, &request(MEMORY_SOURCE, out.as_mut_ptr().cast(), 16, plain.as_ptr().cast(), 0, 16));
-        // Half of four: the queue submitted itself. Time for a read started
-        // then to land in the old page.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        // SAFETY: the list outlives the request, which reads it when it runs.
-        unsafe { std::ptr::write_volatile(list.as_mut_ptr(), pages[1]) };
-        enqueue_status(queue, array, 0);
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(out, plain[..16]);
-        // SAFETY: both pages are mapped read-write.
-        let (first, second) = unsafe {
-            (
-                std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()),
-                std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE), plain.len()),
-            )
-        };
-        assert_eq!(second, plain);
-        assert!(first.iter().all(|&b| b == 0), "the old page was written");
-    }
-
     #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
         use crate::modules::xmem;
