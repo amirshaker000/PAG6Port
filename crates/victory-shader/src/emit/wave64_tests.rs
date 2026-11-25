@@ -123,11 +123,11 @@ fn lowered_on(
         st: &st,
         io: &io,
         res: &res,
+        gs: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        gs: None,
     });
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
@@ -1495,15 +1495,15 @@ fn flag_program(second: Option<u32>) -> NativeProgram {
     let mut body = vec![
         0x7E12_0280, // v_mov_b32 v9, 0
     ];
-    body.extend_from_slice(&ds(DS_WRITE_B32, 0, 9, 9)); // ds_write_b32 v9, v9
+    body.extend_from_slice(&ds0(DS_WRITE_B32, 0, 9, 9)); // ds_write_b32 v9, v9
     let mut branch = vec![0x7E04_0281]; // v_mov_b32 v2, 1
-    branch.extend_from_slice(&ds(DS_WRITE_B32, 0, 9, 2)); // ds_write_b32 v9, v2
+    branch.extend_from_slice(&ds0(DS_WRITE_B32, 0, 9, 2)); // ds_write_b32 v9, v2
     // (a scalar exit from the branch makes it blocks of their own, which only its lanes run)
-    let mut rest = ds(DS_READ_B32, 3, 9, 0).to_vec(); // ds_read_b32 v3, v9
+    let mut rest = ds0(DS_READ_B32, 3, 9, 0).to_vec(); // ds_read_b32 v3, v9
     if let Some(k) = second {
         rest.push(0x7E0C_02FF); // v_mov_b32 v6, lit
         rest.push(k);
-        rest.extend_from_slice(&ds(DS_WRITE_B32, 0, 9, 6)); // ds_write_b32 v9, v6
+        rest.extend_from_slice(&ds0(DS_WRITE_B32, 0, 9, 6)); // ds_write_b32 v9, v6
     }
     branch.extend_from_slice(&[
         0xBF07_8001,                       // s_cmp_lg_u32 s1, 0
@@ -1517,7 +1517,7 @@ fn flag_program(second: Option<u32>) -> NativeProgram {
     ]);
     body.extend_from_slice(&branch);
     body.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
-    body.extend_from_slice(&ds(DS_READ_B32, 5, 9, 0)); // ds_read_b32 v5, v9
+    body.extend_from_slice(&ds0(DS_READ_B32, 5, 9, 0)); // ds_read_b32 v5, v9
     body.extend_from_slice(&[
         0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
@@ -1532,7 +1532,7 @@ fn flag_program(second: Option<u32>) -> NativeProgram {
 }
 
 /// DS `op vdst, addr, data0` at offset 0.
-const fn ds(op: u8, vdst: u8, addr: u8, data0: u8) -> [u32; 2] {
+const fn ds0(op: u8, vdst: u8, addr: u8, data0: u8) -> [u32; 2] {
     [0x36 << 26 | (op as u32) << 18, (vdst as u32) << 24 | (data0 as u32) << 8 | addr as u32]
 }
 
@@ -1552,6 +1552,7 @@ fn flag_wave(native: &NativeProgram) -> Option<u32> {
         st: &st,
         io: &io,
         res: &res,
+        gs: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
