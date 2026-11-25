@@ -89,6 +89,8 @@ pub(crate) mod gs;
 #[cfg(all(test, windows))]
 mod descriptor_tests;
 #[cfg(all(test, windows))]
+mod descriptor_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
@@ -853,37 +855,6 @@ fn emit_forms(
                 if done(&local) {
                     return exactly(local);
                 }
-            }
-        }
-        // Last of all (`VICTORY_WAVE_LDS_LOOSE=1` turns it on): LDS read and written inside
-        // one lane-branch region, ordered between the two host waves only where the region
-        // is entered and left (`lower::with_loose_lds`, approximate). A 32-lane host refuses
-        // the 64-lane form outright, which drops every dispatch of the program.
-        // Flamingo: off by default. In run 54 the three programs it let run
-        // made the world grainy and smeared (refused, their passes were left
-        // out and the picture was clean).
-        let loose_on = std::env::var_os("VICTORY_WAVE_LDS_LOOSE").is_some_and(|v| v == "1");
-        if loose_on && !strict {
-            let bases = [forms[0].1.as_ref(), forms[1].1.as_ref()];
-            for (name, f) in [("without early-outs", bases[0]), ("without skips", bases[1])] {
-                if let Some((p, st, io, res)) = f {
-                    let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
-                    report(&format!("loose LDS (APPROXIMATE), {name}"), &again);
-                    if done(&again) {
-                        return again;
-                    }
-                }
-            }
-            let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
-            report("loose LDS (APPROXIMATE)", &again);
-            if done(&again) {
-                return again;
-            }
-            if local_on && !exact_only {
-                let local = lower::with_loose_lds(|| lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res)));
-                report("loose LDS + local waves (APPROXIMATE, any mask)", &local);
-                if done(&local) {
-                    return local;
                 }
             }
         }
@@ -3020,107 +2991,106 @@ mod barycentric_tests {
         assert_eq!(rows, [("SV_Position", 0, Some(0)), ("TEXCOORD", 1, Some(2))]);
         validate(&shader);
     }
-}
 
-/// The geometry stage's first step: containers of the merged ES+GS stage
-/// (synthetic programs) get past tracing and I/O raising and stop at
-/// [`GS_EMIT`] in emission.
-#[cfg(test)]
-mod merged_gs_tests {
-    use super::*;
-    use crate::native::tests::container;
+    /// The geometry stage's first step: containers of the merged ES+GS stage
+    /// (synthetic programs) get past tracing and I/O raising and stop at
+    /// [`GS_EMIT`] in emission.
+    #[cfg(test)]
+    mod merged_gs_tests {
+        use super::*;
+        use crate::native::tests::container;
 
-    fn bytes(words: &[u32]) -> Vec<u8> {
-        words.iter().flat_map(|w| w.to_le_bytes()).collect()
-    }
+        fn bytes(words: &[u32]) -> Vec<u8> {
+            words.iter().flat_map(|w| w.to_le_bytes()).collect()
+        }
 
-    const S_ENDPGM: u32 = 0xBF81_0000;
+        const S_ENDPGM: u32 = 0xBF81_0000;
 
-    /// `s_load_dword s0, s[<base>:<base + 1>], 0xb8`, then the end.
-    fn load(base: u32) -> Vec<u8> {
-        bytes(&[0xF400_0000 | base >> 1, 0xFA00_00B8, S_ENDPGM])
-    }
+        /// `s_load_dword s0, s[<base>:<base + 1>], 0xb8`, then the end.
+        fn load(base: u32) -> Vec<u8> {
+            bytes(&[0xF400_0000 | base >> 1, 0xFA00_00B8, S_ENDPGM])
+        }
 
-    #[test]
-    fn a_geometry_container_alone_does_not_trace() {
-        // The load through the runtime table pointer (user data 0 and 1) is
-        // "an address in an SGPR that is no root parameter" until the ES
-        // half's layout says nothing is there.
-        let gs = container(&[(HwStage::Gs, &load(8))]);
-        assert!(matches!(
-            translate(&gs),
-            Err(ShaderError::Unsupported { what, .. })
-                if what == "an address in an SGPR that is no root parameter"
-        ));
-    }
+        #[test]
+        fn a_geometry_container_alone_does_not_trace() {
+            // The load through the runtime table pointer (user data 0 and 1) is
+            // "an address in an SGPR that is no root parameter" until the ES
+            // half's layout says nothing is there.
+            let gs = container(&[(HwStage::Gs, &load(8))]);
+            assert!(matches!(
+                translate(&gs),
+                Err(ShaderError::Unsupported { what, .. })
+                    if what == "an address in an SGPR that is no root parameter"
+            ));
+        }
 
-    /// The ES half of a pair: record of five dwords, then the handover.
-    fn es_half() -> Vec<u8> {
-        bytes(&crate::handoff::tests::es_words())
-    }
+        /// The ES half of a pair: record of five dwords, then the handover.
+        fn es_half() -> Vec<u8> {
+            bytes(&crate::handoff::tests::es_words())
+        }
 
-    /// The GS half: reads of two vertices' records, then the load through
-    /// the runtime table.
-    fn gs_half() -> Vec<u8> {
-        let mut words = crate::handoff::tests::gs_words();
-        words.pop();
-        words.extend([0xF400_0004, 0xFA00_00B8, S_ENDPGM]);
-        bytes(&words)
-    }
+        /// The GS half: reads of two vertices' records, then the load through
+        /// the runtime table.
+        fn gs_half() -> Vec<u8> {
+            let mut words = crate::handoff::tests::gs_words();
+            words.pop();
+            words.extend([0xF400_0004, 0xFA00_00B8, S_ENDPGM]);
+            bytes(&words)
+        }
 
-    #[test]
-    fn an_es_and_a_gs_container_pair_and_translate() {
-        let es = gs::tests::es_container();
-        let gs = gs::tests::gs_container(3);
-        let out = translate_merged_gs(&es, &gs).unwrap();
-        assert_eq!(out.record_dwords, 5);
-        let (_, h) = merged_halves(&es, &gs).unwrap();
-        assert_eq!((h.es.dwords, h.vertices), (5, 2));
-    }
+        #[test]
+        fn an_es_and_a_gs_container_pair_and_translate() {
+            let es = gs::tests::es_container();
+            let gs = gs::tests::gs_container(3);
+            let out = translate_merged_gs(&es, &gs).unwrap();
+            assert_eq!(out.record_dwords, 5);
+            let (_, h) = merged_halves(&es, &gs).unwrap();
+            assert_eq!((h.es.dwords, h.vertices), (5, 2));
+        }
 
-    #[test]
-    fn a_gs_half_without_output_records_is_refused_with_its_reason() {
-        let es = container(&[(HwStage::Es, &es_half()), (HwStage::Vs, &bytes(&[S_ENDPGM]))]);
-        let gs = container(&[(HwStage::Gs, &gs_half())]);
-        let r = translate_merged_gs(&es, &gs);
-        assert!(matches!(r, Err(ShaderError::Unsupported { what, .. })
-            if what == "a geometry program that emits no vertex"), "{r:?}");
-    }
+        #[test]
+        fn a_gs_half_without_output_records_is_refused_with_its_reason() {
+            let es = container(&[(HwStage::Es, &es_half()), (HwStage::Vs, &bytes(&[S_ENDPGM]))]);
+            let gs = container(&[(HwStage::Gs, &gs_half())]);
+            let r = translate_merged_gs(&es, &gs);
+            assert!(matches!(r, Err(ShaderError::Unsupported { what, .. })
+                if what == "a geometry program that emits no vertex"), "{r:?}");
+        }
 
-    #[test]
-    fn an_es_half_that_does_not_hand_over_stops_the_pair_before_the_gs_half() {
-        let es = container(&[(HwStage::Es, &bytes(&[S_ENDPGM]))]);
-        let gs = container(&[(HwStage::Gs, &gs_half())]);
-        let r = translate_merged_gs(&es, &gs);
-        assert!(matches!(r, Err(ShaderError::Unsupported { what, .. })
-            if what == "an ES half that does not hand over to the GS half"), "{r:?}");
-    }
+        #[test]
+        fn an_es_half_that_does_not_hand_over_stops_the_pair_before_the_gs_half() {
+            let es = container(&[(HwStage::Es, &bytes(&[S_ENDPGM]))]);
+            let gs = container(&[(HwStage::Gs, &gs_half())]);
+            let r = translate_merged_gs(&es, &gs);
+            assert!(matches!(r, Err(ShaderError::Unsupported { what, .. })
+                if what == "an ES half that does not hand over to the GS half"), "{r:?}");
+        }
 
-    #[test]
-    fn containers_that_are_not_an_es_and_a_gs_do_not_pair() {
-        let es = container(&[(HwStage::Es, &es_half())]);
-        let vs = container(&[(HwStage::Vs, &bytes(&[S_ENDPGM]))]);
-        let gs = container(&[(HwStage::Gs, &gs_half())]);
-        for (a, b) in [(&gs, &gs), (&vs, &gs), (&es, &vs), (&gs, &es)] {
-            assert!(translate_merged_gs(a, b).is_err(), "paired");
+        #[test]
+        fn containers_that_are_not_an_es_and_a_gs_do_not_pair() {
+            let es = container(&[(HwStage::Es, &es_half())]);
+            let vs = container(&[(HwStage::Vs, &bytes(&[S_ENDPGM]))]);
+            let gs = container(&[(HwStage::Gs, &gs_half())]);
+            for (a, b) in [(&gs, &gs), (&vs, &gs), (&es, &vs), (&gs, &es)] {
+                assert!(translate_merged_gs(a, b).is_err(), "paired");
+            }
+        }
+
+        #[test]
+        fn other_unbound_pointers_still_fail_where_they_did() {
+            // Not the runtime table: user data 12 and 13 hold no parameter.
+            let gs = container(&[(HwStage::Gs, &load(20))]);
+            assert!(matches!(
+                translate(&gs),
+                Err(ShaderError::Unsupported { what, .. })
+                    if what == "an address in an SGPR that is no root parameter"
+            ));
+            // The same load in the hardware VS, whose SGPR 8 is no parameter either.
+            let vs = container(&[(HwStage::Vs, &load(8))]);
+            assert!(matches!(
+                translate(&vs),
+                Err(ShaderError::Unsupported { what, .. })
+                    if what == "an address in an SGPR that is no root parameter"
+            ));
         }
     }
-
-    #[test]
-    fn other_unbound_pointers_still_fail_where_they_did() {
-        // Not the runtime table: user data 12 and 13 hold no parameter.
-        let gs = container(&[(HwStage::Gs, &load(20))]);
-        assert!(matches!(
-            translate(&gs),
-            Err(ShaderError::Unsupported { what, .. })
-                if what == "an address in an SGPR that is no root parameter"
-        ));
-        // The same load in the hardware VS, whose SGPR 8 is no parameter either.
-        let vs = container(&[(HwStage::Vs, &load(8))]);
-        assert!(matches!(
-            translate(&vs),
-            Err(ShaderError::Unsupported { what, .. })
-                if what == "an address in an SGPR that is no root parameter"
-        ));
-    }
-}
