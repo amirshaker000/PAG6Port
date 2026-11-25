@@ -89,8 +89,6 @@ pub(crate) mod gs;
 #[cfg(all(test, windows))]
 mod descriptor_tests;
 #[cfg(all(test, windows))]
-mod descriptor_tests;
-#[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
@@ -854,7 +852,6 @@ fn emit_forms(
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return exactly(local);
-                }
                 }
             }
         }
@@ -3094,3 +3091,4 @@ mod barycentric_tests {
             ));
         }
     }
+}
