@@ -398,6 +398,7 @@ fn workers() -> bool {
                         use windows::Win32::System::Threading::*;
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
+                    crate::framelog::keep_on_fast_cores("victory-pipelines");
                     loop {
                         // All of them during the intro and the menus starve
                         // the title's threads: frames come unevenly.
