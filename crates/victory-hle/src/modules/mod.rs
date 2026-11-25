@@ -25,6 +25,8 @@ pub mod lifecycle;
 #[cfg(windows)]
 pub mod media;
 #[cfg(windows)]
+pub mod mouse;
+#[cfg(windows)]
 pub mod net;
 pub mod speech;
 pub mod storage;

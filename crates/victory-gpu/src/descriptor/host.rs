@@ -1112,7 +1112,7 @@ impl HostHeap {
         // more than a few failed walks a frame.
         static FAILED: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
         const WALKS: u64 = 8;
-        let frame = crate::queue::presented();
+        let frame = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         if FAILED[0].swap(frame, std::sync::atomic::Ordering::Relaxed) != frame {
             FAILED[1].store(0, std::sync::atomic::Ordering::Relaxed);
         }

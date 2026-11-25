@@ -153,6 +153,8 @@ fn hook(hwnd: HWND) {
     if hwnd.is_null() {
         return;
     }
+    // The mouse reports through the hooked procedure (VICTORY_MOUSE=1).
+    super::mouse::attach(hwnd as *mut c_void);
     // SAFETY: a window this thread just created. The title's procedure is
     // stored before ours can run.
     unsafe {
@@ -168,6 +170,11 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // The mouse as the right stick: raw input counts, cursor held to the
+    // window's centre while the title has the focus (VICTORY_MOUSE=1).
+    if super::mouse::on_message(hwnd as isize, message, wparam, lparam) {
+        return 0;
+    }
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
