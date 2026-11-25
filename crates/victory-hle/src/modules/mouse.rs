@@ -77,11 +77,16 @@ struct RawInputDevice {
 #[repr(C)]
 #[derive(Default)]
 struct RawMouseInput {
+    /// RAWINPUTHEADER: (DWORD dwType, DWORD dwSize, HANDLE hDevice,
+    /// WPARAM wParam) - `dwType` is the FIRST dword (0: mouse).
     header: [u32; 8],
+    /// RAWMOUSE: usFlags.
     flags: u32,
+    /// usButtonFlags, usButtonData.
     button_flags: u16,
     button_data: u16,
     raw_buttons: u32,
+    /// lLastX, lLastY.
     last_x: i32,
     last_y: i32,
     extra: [u32; 5],
@@ -164,7 +169,7 @@ pub(crate) fn on_message(hwnd: isize, message: u32, wparam: usize, lparam: isize
                 GetRawInputData(lparam, RID_INPUT, &mut raw as *mut _ as *mut core::ffi::c_void, &mut size, 24)
             };
             if n != u32::MAX
-                && raw.header[3] == RIM_TYPEMOUSE
+                && raw.header[0] == RIM_TYPEMOUSE
                 && CAPTURED.load(Ordering::Acquire)
                 && raw.flags & MOUSE_MOVE_ABSOLUTE == 0
             {
