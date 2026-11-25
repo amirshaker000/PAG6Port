@@ -110,6 +110,30 @@ fn wait_budget() -> Duration {
     })
 }
 
+/// What a frame may wait while a world loads: pipelines are asked for by
+/// the hundred then, and a pass the title runs once is lost if its
+/// pipeline is not there (walls, floor, faces never came back). All such
+/// waits of a run together are bounded (`VICTORY_PIPELINE_GATE_S`, 0: off);
+/// the title's GPU watchdog bounds one frame's (30 s). Ported from
+/// PastiiJay/klbf-lab (beta, make.rs).
+const LOADING_FRAME: Duration = Duration::from_secs(4);
+/// The same for compute pipelines, waited for apart: the passes that unpack
+/// a world's models are dispatched once, and dropping them loses geometry.
+const LOADING_FRAME_COMPUTE: Duration = Duration::from_secs(12);
+
+/// `VICTORY_PIPELINE_GATE_S`: the bound on all of them (0: none of them).
+fn loading_left(spent: Duration) -> Duration {
+    static TOTAL: OnceLock<Duration> = OnceLock::new();
+    let total = *TOTAL.get_or_init(|| {
+        let seconds = std::env::var("VICTORY_PIPELINE_GATE_S")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(120);
+        Duration::from_secs(seconds)
+    });
+    total.saturating_sub(spent)
+}
+
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
@@ -219,6 +243,14 @@ fn wait(p: &Pending, frame: u64) {
     if budget.is_zero() {
         return;
     }
+    // While a world loads, a compute pipeline is waited for far longer than
+    // the frame's budget: the title dispatches the passes that unpack its
+    // models once, and a dispatch without its pipeline is lost for good.
+    let compute = p.graphics.is_none();
+    static LOADINGS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    let past_total = &LOADINGS[usize::from(compute)];
+    let loading = loading_left(Duration::from_millis(past_total.load(Ordering::Relaxed)));
+    let budget = budget.max((if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME }).min(loading));
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
     static SPENT: Mutex<WaitBudget> = Mutex::new(WaitBudget {
@@ -242,6 +274,9 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    // What this wait went past the per-frame budget costs the loading gate.
+    let past = waited.saturating_sub(wait_budget());
+    past_total.fetch_add(past.as_millis() as u64, Ordering::Relaxed);
     {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
