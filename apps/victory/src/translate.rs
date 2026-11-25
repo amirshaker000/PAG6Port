@@ -561,6 +561,8 @@ fn translate(
 fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
+        // as `emit::translate` does for a host of 32-lane waves
+        let p = if emit::host_max_wave() == 32 { victory_shader::spill::thread_limited(p) } else { p };
         match victory_shader::spill::build(&p) {
             Ok(program) => {
                 t.translated += 1;

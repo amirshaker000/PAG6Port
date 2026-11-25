@@ -103,6 +103,7 @@ mod rect;
 mod sampler;
 mod shader;
 mod threading;
+mod uniform;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -439,6 +440,14 @@ pub fn translate_merged_gs(es: &[u8], gs: &[u8]) -> Result<MergedShaders, Shader
     // The GS half.
     let gc = Container::parse(gs)?;
     let native = merged.program();
+    // A host of 32-lane waves cannot take the early exit of lower_with_thread_limit`r
+    // (see spill::thread_limited): the thread count masks EXEC ahead of the program
+    // (DexNom/VIctory #35, the builder's box-rehydration kernels on NVIDIA).
+    let native = if lower::host_max_wave() == 32 {
+        crate::spill::thread_limited(native)
+    } else {
+        native
+    };
     let p = crate::spill::build(&native)?;
     let st = structure::structure(&p);
     let res = resource::track_merged(&p, &native.layout, native.stage, st.as_ref().ok())?;

@@ -61,6 +61,90 @@ pub fn is_spilled(native: &NativeProgram) -> bool {
     spilled(native).is_some()
 }
 
+/// SGPRs the entry code of [`thread_limited`] uses: no program of the kind reads
+/// them before writing them (the hardware leaves them as the last wave did).
+const SCRATCH: [u32; 3] = [100, 101, 102];
+
+/// `native` with its EXEC masked on entry by the dispatch's thread count, if it is a
+/// compute program with a spilled user-data table that gets its group's number along x
+/// and whose group is a power of two of threads along x and one along y and z; else
+/// unchanged. For a host of 32-lane waves, where the early exit of
+/// `lower_with_thread_limit` cannot be used: that one needs the program as one 64-lane
+/// wave, which such a card refuses, and a console wave run as two host waves that
+/// exchange their halves needs every thread to stay.
+///
+/// The console's `DispatchX` can count threads (the structure builder's passes over
+/// shipped structures): the last group then starts with only its first lanes in EXEC, and
+/// the programs count those lanes (`s_bcnt1_i32_b64 exec`). The program gets the count as
+/// one more parameter (index one past its last, kind
+/// [`crate::emit::USER_DISPATCH_THREADS`]: the threads left from this dispatch's first
+/// group on, 0 for a dispatch of whole groups) and these instructions in front, which
+/// leave in EXEC what the hardware's launch does:
+///
+/// ```text
+/// s_and_b32  s101, s1, 0xff             ; the table's address, as the program forms it
+/// s_mov_b32  s100, s0
+/// s_load_dword s102, s[100:101], count  ; rewritten by `user_data` like any parameter
+/// s_add_u32  s102, s102, -1             ; 0 (no count) becomes the highest number
+/// v_lshl_add_u32 vN, group, log2(threads), v0
+/// v_cmp_ge_u32 vcc, s102, vN
+/// s_and_b64  exec, exec, vcc            ; s_and_b32 exec_lo for a 32-lane program
+/// ```
+///
+/// The title's code runs unchanged behind them, so lane counts, saved EXECs and scans that
+/// turn every lane on behave as on the console in every form the translator has.
+pub fn thread_limited(mut native: NativeProgram) -> NativeProgram {
+    let Some(spilled) = spilled(&native) else {
+        return native;
+    };
+    let StageIo::Cs(cs) = &native.io else {
+        return native;
+    };
+    let [threads, 1, 1] = cs.threads else {
+        return native;
+    };
+    let (Some(group), true) = (cs.system_sgprs().0[0], threads.is_power_of_two()) else {
+        return native;
+    };
+    let Some(index) = spilled.iter().map(|&(first, dwords)| first + dwords).max().filter(|&i| i < 256) else {
+        return native;
+    };
+    let scratch = u32::from(native.vgprs);
+    if scratch > 255 {
+        return native;
+    }
+    let [low, high, count] = SCRATCH;
+    let words = [
+        0x8000_0000 | 14 << 23 | high << 16 | 0xFF << 8 | 1, // s_and_b32 high, s1, literal
+        0xFF,
+        0xBE80_0300 | low << 16, // s_mov_b32 low, s0
+        0x3D << 26 | count << 6 | (low / 2), // s_load_dword count, s[low:high], offset
+        (125 << 25) | (4 * (index - FIRST)),
+        0x8000_0000 | count << 16 | 0xC1 << 8 | count, // s_add_u32 count, count, -1
+        0xD746_0000 | scratch, // v_lshl_add_u32 scratch, group, log2(threads), v0
+        u32::from(group) | (0x80 + threads.trailing_zeros()) << 9 | 0x100 << 18,
+        0x7D8C_0000 | scratch << 9 | count, // v_cmp_ge_u32 vcc, count, scratch
+        if native.wave64 {
+            0x8000_0000 | 15 << 23 | 126 << 16 | 106 << 8 | 126 // s_and_b64 exec, exec, vcc
+        } else {
+            0x8000_0000 | 14 << 23 | 126 << 16 | 106 << 8 | 126 // s_and_b32 exec_lo, exec_lo, vcc_lo
+        },
+    ];
+    let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    code.extend_from_slice(&native.code);
+    native.code = code;
+    native.vgprs += 1;
+    native.layout.push(crate::native::RootParam {
+        root: crate::native::RootType::Other(crate::emit::USER_DISPATCH_THREADS),
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: index as u8,
+        slot: 0,
+    });
+    native
+}
+
 /// Rewrites the loads of `native`'s spilled user-data table in `p`; returns
 /// how many loads it replaced. Nothing changes unless the program is a
 /// compute program whose layout has entries past its user SGPRs, the first

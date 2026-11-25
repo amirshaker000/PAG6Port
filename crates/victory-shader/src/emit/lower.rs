@@ -441,7 +441,7 @@ pub(super) const CHOSEN: Why = "a descriptor chosen by control flow";
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
-fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
+pub(super) fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     let n = st.exits.len();
     let mut all = vec![true; n];
     for (_, region) in lane_regions(st)? {
@@ -3255,6 +3255,8 @@ impl<'a> Lower<'a> {
         match rp.root {
             RootType::ResourceHeap | RootType::SamplerHeap => return Val::I32(self.s.m.i32(0)),
             RootType::Constants | RootType::Table => {}
+            // The dispatch's thread count, which the host sets (`spill::thread_limited`).
+            RootType::Other(super::shader::USER_DISPATCH_THREADS) => {}
             _ => return Val::Missing("a root descriptor"),
         }
         let index = u32::from(rp.user_data) + dword - self.user_first();
