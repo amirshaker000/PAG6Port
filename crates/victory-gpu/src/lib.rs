@@ -21,6 +21,10 @@ mod ambient;
 mod capture;
 #[cfg(windows)]
 mod cardmeter;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod renderdoc;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod shot;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -41,6 +45,8 @@ pub mod frame;
 mod heap_pass;
 #[cfg(windows)]
 pub mod framelog;
+#[cfg(windows)]
+mod compose;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]

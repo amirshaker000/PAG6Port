@@ -2823,6 +2823,7 @@ impl<'a> Lower<'a> {
                     for j in end + 1..after {
                         self.section_inst(b, j, i);
                     }
+>>>>>>> theirs
                     i = after;
                     continue;
                 }

@@ -139,6 +139,10 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
         return false;
     }
+    // Two planes are blended (`crate::compose`) by the present in line.
+    if planes > 1 && crate::compose::on() {
+        return false;
+    }
     let frame = FRAMES.load(Ordering::Relaxed) + 1;
     // A frame that is saved or listed is read back at once.
     #[cfg(feature = "diagnostics")]
@@ -263,6 +267,15 @@ fn submit_cut(this: This, lists: &[This]) {
     } else {
         0
     };
+    // A frame shot learns that its frame's lists are being submitted.
+    #[cfg(feature = "diagnostics")]
+    if crate::shot::recording() {
+        for &l in lists {
+            if let Some(h) = crate::list::host_list(l) {
+                crate::shot::submitted(h);
+            }
+        }
+    }
     #[cfg(feature = "diagnostics")]
     crate::capture::op(this as usize, || {
         let named: Vec<String> = lists
@@ -344,6 +357,15 @@ fn submit_split(this: This, lists: &[This]) {
     } else {
         0
     };
+    // A frame shot learns that its frame's lists are being submitted.
+    #[cfg(feature = "diagnostics")]
+    if crate::shot::recording() {
+        for &l in lists {
+            if let Some(h) = crate::list::host_list(l) {
+                crate::shot::submitted(h);
+            }
+        }
+    }
     #[cfg(feature = "diagnostics")]
     crate::capture::op(this as usize, || {
         let named: Vec<String> = lists
@@ -879,7 +901,7 @@ fn release_held_now(force: bool) {
                     Held::Present(texture, state, frame) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame);
+                                let _ = host.present(&texture, state, None, frame);
                             }
                         };
                         if forcing {
@@ -1381,6 +1403,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
+        crate::renderdoc::frame_drew(frame, crate::draw::drawn());
+        crate::shot::present(frame, crate::draw::drawn());
         if crate::capture::listed(frame) {
             crate::capture::dump_targets(frame);
         }

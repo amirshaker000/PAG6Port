@@ -2475,6 +2475,10 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
         // 64-bit inline integers are sign-extended.
+        // Literals below 2^31: zero and sign extension agree.
+        ("s_mov_b64", Operand::Literal(x)) if (x as i32) >= 0 => {
+            Some(Moved::Const(if k == 0 { x } else { 0 }))
+        }
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;
             Some(Moved::Const(if k == 0 {
