@@ -547,6 +547,11 @@ struct Lower<'a> {
     /// The paired form: whether the last LDS access of the IR block being lowered wrote (none
     /// at its start), for the fences between accesses ([`Self::paired_inst`]).
     lds_last: Option<bool>,
+    /// With `split_lds`: whether the LDS reads from here on in the IR block being lowered see
+    /// the same writes as the last one, which met the other host wave before it (a group
+    /// barrier that waits). A run of reads then shares that barrier; it is local to the
+    /// block (a predecessor may have written LDS or taken another way in).
+    lds_reads_ordered: bool,
     /// The paired form: scalars each lane has its own of (a waterfall loop's first-lane reads
     /// and what is computed from them), on which no branch takes both lanes of a thread.
     lane_scalars: HashSet<Value>,
@@ -1415,7 +1420,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
-        // LDS accesses get a group barrier each (a console wave split in two host waves)
+        // LDS accesses need group barriers where a console wave is split in two host waves.
         let mut split_lds = false;
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
         // where the host waves meet around those branches (`lds_meetings`)
@@ -1783,6 +1788,7 @@ impl<'a> Lower<'a> {
             twin: paired.then(Box::default),
             upper: false,
             lds_last: None,
+            lds_reads_ordered: false,
             lane_scalars: if paired { lane_scalars(p, x.res) } else { HashSet::new() },
             drop_in,
             drop_out,
@@ -2567,8 +2573,10 @@ impl<'a> Lower<'a> {
                 self.block_phis(b);
                 self.swap_lanes();
             }
+            self.lds_reads_ordered = false;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
+                self.lds_reads_ordered = super::group_sync() != 0;
             }
             self.lds_last = None;
             let mut i = 0;
@@ -2586,6 +2594,7 @@ impl<'a> Lower<'a> {
                             self.section_inst(b, j, i);
                         }
                     }
+                    self.lds_reads_ordered = false;
                     i = end;
                     continue;
                 }
@@ -5777,10 +5786,17 @@ impl<'a> Lower<'a> {
             && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
         {
             // the two host waves of a console wave meet before each LDS access: what the other
-            // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            // half wrote is visible, and what it still reads is not overwritten. All reads in
+            // a run see the same writes, so they share one meeting; the one before a write or
+            // atomic still waits for every read before it.
+            let read = matches!(&inst.fields, Fields::Ds { gds: false, data, .. }
+                if data.is_empty() && name.starts_with("ds_read"));
+            if !read || !self.lds_reads_ordered {
+                self.lds_meeting();
+            }
+            self.lds_reads_ordered = read && super::group_sync() != 0;
+        } else if name != "s_nop" && !name.starts_with("s_waitcnt") {
+            self.lds_reads_ordered = false;
         }
         // The structure builder's threads take turns through atomics (a tree
         // built from its leaves up): what one wrote before its atomic is
@@ -5811,6 +5827,7 @@ impl<'a> Lower<'a> {
                 if !waits {
                     mode &= !1;
                 }
+                self.lds_reads_ordered = self.split_lds && waits;
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s
@@ -5845,6 +5862,7 @@ impl<'a> Lower<'a> {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
+                self.lds_reads_ordered = false;
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }
