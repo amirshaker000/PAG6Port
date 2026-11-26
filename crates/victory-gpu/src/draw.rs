@@ -5946,7 +5946,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View, record: u64) {
             #[cfg(feature = "diagnostics")]
             let step = LayerStep::named(list, || texture_label("tables: alias copy into", *resource));
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
             #[cfg(feature = "diagnostics")]
             drop(step);
             if !aliased
