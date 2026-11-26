@@ -1338,6 +1338,90 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     base
 }
 
+/// (soldsawn b4ff304f) How many of its largest levels the host copy of a
+/// texture described by `desc` leaves out at least
+/// (`VICTORY_TEXTURE_DROP_MIPS=N`, at most 4; 0, the default, leaves out
+/// none). Each level left out divides the texture's bytes by about four:
+/// on an 8 GB card the textures picked by index stop at the memory budget
+/// with about 15,000 more due, and the GPU time per frame triples (RTX 4060
+/// Ti, first room). Only 2D textures the title fills ([`fills`]), arrays
+/// and cubes included, at least 512 texels on their shorter side, whose
+/// sides the levels left out halve exactly into whole 4-texel blocks: host
+/// level `m` is then title level `m + N` texel for texel. On this tree the
+/// levels left out are the host copy's base level ([`HostTexture::base`],
+/// as for held levels, [`held_only`]): the larger of the two. Shaders see
+/// the texture at half the size per level left out: views shift their
+/// levels (`descriptor::host` `from_base`, [`shift_levels`]), copies from
+/// a buffer go to the level the host copy has ([`host_subresource`]), and
+/// other copies between such a texture and another are skipped (`list.rs`
+/// `unlike`).
+#[cfg(windows)]
+pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let n = *N.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_DROP_MIPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(4)
+    });
+    if n == 0 || !fills(desc) || desc.dimension != TEXTURE_2D || desc.sample_count > 1 {
+        return 0;
+    }
+    let n = n.min(u32::from(desc.mip_levels).saturating_sub(1));
+    let (w, h) = (desc.width, u64::from(desc.height));
+    let whole = |side: u64| side % (4 << n) == 0;
+    if n == 0 || w.min(h) < 512 || !whole(w) || !whole(h) {
+        return 0;
+    }
+    n
+}
+
+/// The title levels the host copy of title texture `this` leaves out, if
+/// [`drop_levels`] leaves out any (its base level, which held levels may
+/// raise further); 0 for buffers, null, and every texture with the switch
+/// off.
+#[cfg(windows)]
+pub(crate) fn dropped(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    let drop = drop_levels(&resource(this).desc);
+    if drop == 0 {
+        return 0;
+    }
+    made_copy(this).map_or(drop, |copy| copy.base.max(drop))
+}
+
+/// The host copy's subresource for subresource `index` of title texture
+/// `this`, whose host copy leaves out [`dropped`] levels: `None` for a
+/// level it leaves out.
+#[cfg(windows)]
+pub(crate) fn host_subresource(this: This, index: u32) -> Option<u32> {
+    let drop = dropped(this);
+    let mips = u32::from(resource(this).desc.mip_levels).max(1);
+    let (mip, slice) = (index % mips, index / mips);
+    (mip >= drop).then(|| mip - drop + slice * (mips - drop))
+}
+
+/// A shader view's first level, level count and smallest-level clamp
+/// (`first`, `levels`, `clamp`) on a host texture that leaves out `drop`
+/// title levels: the same texels where they are there, else the host's
+/// largest level. A level count of `u32::MAX` (all of them) stays.
+pub(crate) fn shift_levels(drop: u32, first: &mut u32, levels: &mut u32, clamp: &mut f32) {
+    if drop == 0 {
+        return;
+    }
+    if *levels != u32::MAX {
+        // Levels the view names that the host texture has: at least one.
+        let end = first.saturating_add(*levels);
+        *levels = end.saturating_sub(drop.max(*first)).max(1);
+    }
+    *first = first.saturating_sub(drop);
+    *clamp = (*clamp - drop as f32).max(0.0);
+}
+
 /// The bytes of title memory a placed texture with the resource description
 /// `desc` is read from for a view that starts at level `first`; `None` as
 /// [`placed_bytes`]. Remembered: asked for every slot that is looked at.
@@ -1395,7 +1479,8 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    // (Never below the levels `VICTORY_TEXTURE_DROP_MIPS` leaves out.)
+    if host.base == 0 || host.base <= base_level(&r.desc, first).max(drop_levels(&r.desc)) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1668,6 +1753,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             if first != u32::MAX {
                 base = base_level(&r.desc, first);
             }
+        }
+        // (soldsawn b4ff304f, `VICTORY_TEXTURE_DROP_MIPS`) The largest
+        // levels left out ([`drop_levels`]), for copies made here (not the
+        // ones made level by level above).
+        if texture.is_none() {
+            base = base.max(drop_levels(&r.desc));
         }
         let texture = match texture {
             Some(texture) => Some(texture),
@@ -4193,6 +4284,24 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// Views of a host copy without its largest level keep their texels:
+    /// a view of title level 0 alone shows host level 0 (title level 1),
+    /// one of levels 3 and 4 shows host levels 2 and 3, all levels stay all.
+    #[test]
+    fn views_shift_down_by_the_levels_left_out() {
+        let shifted = |drop, first, levels, clamp| {
+            let (mut f, mut l, mut c) = (first, levels, clamp);
+            shift_levels(drop, &mut f, &mut l, &mut c);
+            (f, l, c)
+        };
+        assert_eq!(shifted(1, 0, u32::MAX, 0.0), (0, u32::MAX, 0.0));
+        assert_eq!(shifted(1, 0, 1, 0.0), (0, 1, 0.0));
+        assert_eq!(shifted(1, 0, 10, 0.0), (0, 9, 0.0));
+        assert_eq!(shifted(1, 3, 2, 2.5), (2, 2, 1.5));
+        assert_eq!(shifted(2, 1, 1, 0.0), (0, 1, 0.0));
+        assert_eq!(shifted(0, 3, 2, 1.0), (3, 2, 1.0));
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
