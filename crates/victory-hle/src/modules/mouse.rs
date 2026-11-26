@@ -15,7 +15,7 @@
 
 #![allow(non_snake_case)]
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicIsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -98,13 +98,34 @@ pub(crate) fn enabled() -> bool {
     std::env::var_os("VICTORY_MOUSE").is_some_and(|v| v != "0")
 }
 
+/// `VICTORY_MOUSE_DEVICE=1`: the title gets a real GameInput mouse (kind
+/// 0x20, from trustno1-coder/VIctory-NVIDIA 12b1d16d) instead of the stick.
+/// With `VICTORY_MOUSE=1` as well the cursor stays pinned at the centre and
+/// its counts become the device's motion, so the camera never meets an edge.
+pub(crate) fn device() -> bool {
+    std::env::var_os("VICTORY_MOUSE_DEVICE").is_some_and(|v| v != "0")
+}
+
+/// The counts taken off the centre so far (the device's cumulative motion).
+static TOTAL_X: AtomicI64 = AtomicI64::new(0);
+static TOTAL_Y: AtomicI64 = AtomicI64::new(0);
+
+/// The cumulative counts the recentring cursor has seen, for the device.
+pub(crate) fn totals() -> (i64, i64) {
+    (TOTAL_X.load(Ordering::Relaxed), TOTAL_Y.load(Ordering::Relaxed))
+}
+
 /// The title's window is up: the mouse reports to it.
 pub(crate) fn attach(hwnd: *mut core::ffi::c_void) {
     if !enabled() {
         return;
     }
     WINDOW.store(hwnd as isize, Ordering::Release);
-    tracing::info!("the mouse is the pad's right stick (left button right trigger, right button left trigger)");
+    if device() {
+        tracing::info!("the mouse is pinned at the centre and feeds the GameInput mouse device");
+    } else {
+        tracing::info!("the mouse is the pad's right stick (left button right trigger, right button left trigger)");
+    }
 }
 
 /// The window procedure's messages: nothing needed any more, the stick is
@@ -141,6 +162,12 @@ pub(crate) fn apply(pad: &mut super::gameinput::PadState) {
     // The cursor goes back to the centre whether it moved or not: a move of
     // zero keeps it pinned there.
     unsafe { SetCursorPos(c.x, c.y) };
+    TOTAL_X.fetch_add(i64::from(dx), Ordering::Relaxed);
+    TOTAL_Y.fetch_add(i64::from(dy), Ordering::Relaxed);
+    if device() {
+        // The device reports the motion and buttons; the stick stays the pad's.
+        return;
+    }
     // The stick is held between samples: the pad's polls within one frame
     // must all see the same deflection, not a re-decayed one.
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
