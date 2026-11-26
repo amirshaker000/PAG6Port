@@ -64,6 +64,12 @@ pub(crate) struct Shader {
     /// Its result gets the least indirect light ([`crate::ambient`]).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
+    /// Its last reflection output can be bounded by the ambient light.
+    #[cfg(windows)]
+    pub(crate) ends_reflections: bool,
+    /// Its output can provide the sky dome for ambient lighting.
+    #[cfg(windows)]
+    pub(crate) draws_sky: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -171,6 +177,12 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 resolves_light: bytes
                     .windows(crate::ambient::PROGRAM.len())
                     .any(|w| w == crate::ambient::PROGRAM),
+                #[cfg(windows)]
+                ends_reflections: bytes
+                    .windows(crate::ambient::REFLECTED.len())
+                    .any(|w| w == crate::ambient::REFLECTED),
+                #[cfg(windows)]
+                draws_sky: bytes.windows(crate::ambient::SKY.len()).any(|w| w == crate::ambient::SKY),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
@@ -329,6 +341,8 @@ pub(crate) fn merged_pair(es: &Shader, gs: &Shader) -> Result<(Arc<Shader>, Arc<
                     hash: hash.clone(),
                     container: Vec::new(),
                     resolves_light: false,
+                    ends_reflections: false,
+                    draws_sky: false,
                     walks: OnceLock::new(),
                     threads: OnceLock::new(),
                     translated,

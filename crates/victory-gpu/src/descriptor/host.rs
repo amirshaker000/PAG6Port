@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -896,7 +897,22 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
+        // NVIDIA caps a shader-visible view heap at 1,000,000 views (the
+        // title wants about 1,245,000), and 2^18 dynamic slots ran out with
+        // fast settings (thousands of tables a frame refused, each a dropped
+        // draw). `VICTORY_DYNAMIC_SLOTS` takes more of the title's slots
+        // kept in place (tables past those are made afresh here anyway), at
+        // most half the heap (trustno1 a9632bc8).
+        let extra = if sampler {
+            0
+        } else {
+            static CAPPED: OnceLock<u32> = OnceLock::new();
+            *CAPPED.get_or_init(|| {
+                let asked =
+                    std::env::var("VICTORY_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse::<u32>().ok());
+                asked.unwrap_or(DYNAMIC).clamp(DYNAMIC, 1 << 30)
+            })
+        };
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
@@ -3916,13 +3932,21 @@ mod own_copy_tests {
             return; // no host GPU
         };
         let spare = heap.count + heap.dynamic;
-        // [0, 50) and [50, spare - 10): the search goes on at spare - 10,
-        // and the last 10 slots were never taken.
+        // [0, 50) and [50, spare - 10) taken, the last 10 never taken.
         let a = heap.dynamic(50).unwrap();
         let b = heap.dynamic(spare - 60).unwrap();
         assert_eq!((a, b), (4, 4 + 50));
-        // [spare - 20, spare - 10) given back: one run of 20, across it.
-        heap.release(b + spare - 70, 10);
-        assert_eq!(heap.dynamic(20), Some(4 + spare - 20));
+        // Ten slots in the middle given back: a run of 20 was impossible
+        // before them, and is one now (the ranges join on release).
+        // The last fourteen of the second run join the six untaken tail
+        // slots (the pool ends at count + dynamic; spare includes the
+        // title's four) into one run of 20.
+        heap.release(b + (spare - 60) - 14, 14);
+        {
+            let g = heap.slots.lock().unwrap_or_else(|e| e.into_inner());
+            eprintln!("debug: {}", g.debug_state());
+        }
+        let got = heap.dynamic(20).expect("a run of 20 across the taken place");
+        assert!(got + 20 <= spare, "got {got}");
     }
 }

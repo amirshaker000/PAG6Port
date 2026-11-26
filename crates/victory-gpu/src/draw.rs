@@ -22,7 +22,7 @@ use windows::core::Interface;
 
 use crate::host::HostList;
 use crate::object::This;
-use crate::pipeline::host::HostPipeline;
+use crate::pipeline::host::{HostPipeline, Stage};
 
 fn dispatch_contract_allows(required: bool, groups: [u32; 3]) -> bool {
     groups.contains(&0) || !required || groups[0] == 1
@@ -1229,6 +1229,11 @@ impl State {
             };
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
+        }
+        if p.stages.iter().any(|s| s.shader.draws_sky)
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky);
         }
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
@@ -2871,6 +2876,12 @@ impl State {
         let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
             return false;
         };
+        if stage.shader.ends_reflections && !stage.shader.resolves_light {
+            return match self.ambient_view(ResourceType::Uav, crate::ambient::REFLECTIONS, stage) {
+                Some(View::Unordered(r, ..)) if r != 0 => crate::ambient::reflect(list, r as This),
+                _ => false,
+            };
+        }
         let (slot, offset) = crate::ambient::LIGHT;
         let light = stage
             .translated()
@@ -2889,7 +2900,27 @@ impl State {
             once!("no ambient light: the resolve's light is not where it was");
             return false;
         };
-        crate::ambient::raise(list, light as This)
+        let depth = self
+            .ambient_view(ResourceType::Srv, crate::ambient::DEPTH, stage)
+            .and_then(|v| match v {
+                View::Shader(r, _) => Some(r as This),
+                _ => None,
+            });
+        crate::ambient::raise(list, light as This, depth)
+    }
+
+    /// The view at `kind` `which` of the stage's tables, if it is bound.
+    fn ambient_view(&self, kind: ResourceType, which: (u8, u32), stage: &Stage) -> Option<View> {
+        let (slot, offset) = which;
+        stage
+            .translated()
+            .used
+            .iter()
+            .find(|u| u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset))
+            .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
+                Some(Root::Table(table)) => crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4),
+                _ => None,
+            })
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {

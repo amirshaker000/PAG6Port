@@ -69,6 +69,12 @@ impl DynamicSlots {
         Some(first)
     }
 
+    /// What the state is, for tests.
+    #[cfg(test)]
+    pub(super) fn debug_state(&self) -> String {
+        format!("cursor {} available {} too_long {} ranges {:?}", self.cursor, self.available, self.too_long, self.ranges)
+    }
+
     #[cfg(feature = "diagnostics")]
     pub(super) fn is_taken(&self, slot: u32) -> Option<bool> {
         (slot < self.limit).then(|| {
@@ -143,7 +149,7 @@ mod tests {
                 // is two runs, and one take cannot serve it.
                 let any_free = (0..=LIMIT.saturating_sub(count))
                     .any(|first| (first..first + count).all(|f| !taken[f as usize]));
-                let free_bytes: u32 = ranges.ranges.values().map(|v| *v).map(|e| 0u32).sum(); let _ = free_bytes; let got = ranges.take(count);
+                let got = ranges.take(count);
 
                 assert_eq!(got.is_some(), any_free, "count {count}: got {got:?}");
                 if let Some(g) = got {
