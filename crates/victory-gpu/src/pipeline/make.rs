@@ -58,6 +58,9 @@ pub(crate) struct Pending {
     queued_at: OnceLock<Instant>,
     drops: AtomicU64,
     followed: AtomicBool,
+    /// (esat586 f8a76b1e, trustno1 77e13a97) How long draws have waited for
+    /// it so far over all frames, in microseconds ([`wait_once`]).
+    waited_us: AtomicU64,
     /// (fxceless a35c557) The formats its state declares for what a draw draws into
     /// (zeros without a graphics state), and the same shaders and state for other formats
     /// bound at a draw ([`for_formats`]): a chain, one link per set of formats met.
@@ -164,6 +167,7 @@ impl Pending {
             queued_at: OnceLock::new(),
             drops: AtomicU64::new(0),
             followed: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
             variant: OnceLock::new(),
             screen,
@@ -421,6 +425,20 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// (esat586 f8a76b1e; trustno1 77e13a97, the problem of fxceless issue
+/// #1181) Whether one pipeline is waited for at most one budget over the
+/// whole run, not one budget every frame. A pipeline whose make takes longer
+/// than the budget (a driver compile of tens of seconds, or one that never
+/// ends) otherwise cost the whole budget in every frame in which a draw asked
+/// for it: the picture stood still while the thing drawn with it was in view.
+/// After its budget its draws are dropped until it is made, as with any
+/// pipeline past the frame's budget. On by default;
+/// `VICTORY_PIPELINE_WAIT_ONCE=0` waits as before.
+fn wait_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_none_or(|v| v != "0"))
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
@@ -428,6 +446,22 @@ fn wait(p: &Pending, frame: u64) {
     if budget.is_zero() {
         return;
     }
+    wait_with(p, frame, screen, budget, wait_once());
+}
+
+/// As [`wait`], with the budget and the per-pipeline cap given.
+fn wait_with(p: &Pending, frame: u64, screen: bool, budget: Duration, once: bool) {
+    // What is left of this pipeline's own budget ([`wait_once`]); one that
+    // has spent it takes nothing of the frame's.
+    let own = if once {
+        let own = budget.saturating_sub(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)));
+        if own.is_zero() {
+            return;
+        }
+        own
+    } else {
+        Duration::MAX
+    };
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
     static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
@@ -438,7 +472,7 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let left = budget.saturating_sub(spent.1).min(own);
         if shared {
             spent.1 += left;
         }
@@ -459,6 +493,16 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    if once && p.made.get().is_none() {
+        let before = p.waited_us.fetch_add(waited.as_micros().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
+        if Duration::from_micros(before) < budget && Duration::from_micros(before) + waited >= budget {
+            tracing::info!(
+                shaders = ?p.shaders,
+                ms = budget.as_millis() as u64,
+                "a pipeline not made within its wait: its draws are dropped until it is (VICTORY_PIPELINE_WAIT_ONCE=0: waited for every frame)"
+            );
+        }
+    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
@@ -942,6 +986,28 @@ mod tests {
         assert!(matches!(good.made.get(), Some(None)));
 
         bad.make_with(|| panic!("the refused pipeline should stay complete"));
+    }
+
+    /// (esat586 f8a76b1e) A slow pipeline costs one budget in total, and
+    /// leaves the next frame's budget to the others.
+    #[test]
+    fn pipeline_wait_caps_total_wait_per_pipeline_across_frames() {
+        let slow = Pending::new(Vec::new(), None);
+        let fresh = Pending::new(Vec::new(), None);
+        let budget = Duration::from_millis(20);
+        // Frames far from any the other tests use (the budget is per frame).
+        let frame = u64::MAX / 2;
+
+        wait_with(&slow, frame, false, budget, true);
+        assert!(Duration::from_micros(slow.waited_us.load(Ordering::Relaxed)) >= budget);
+
+        let started = Instant::now();
+        wait_with(&slow, frame + 1, false, budget, true);
+        assert!(started.elapsed() < Duration::from_millis(10));
+
+        let started = Instant::now();
+        wait_with(&fresh, frame + 1, false, budget, true);
+        assert!(started.elapsed() >= Duration::from_millis(15));
     }
 
     #[test]
