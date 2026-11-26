@@ -109,9 +109,14 @@ pub(crate) extern "system" fn schedule(
 }
 
 /// Frames begun so far (frame waits that ended).
-pub(crate) fn current() -> u64 {
+pub fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
 }
+
+/// Draws and dispatches the last presented frame ran (Scarlett's meter; the
+/// input module reads it for its OSD).
+pub static PRESENTED_DRAWS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 
 /// For tests of what is done once a frame.
 #[cfg(test)]
