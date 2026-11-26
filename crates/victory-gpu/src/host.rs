@@ -3739,6 +3739,7 @@ fn late_line(frames: f64) {
     }
     card_steps::log(frames);
     crate::watch::port_guard_line(frames);
+    crate::port_journal::line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -5572,7 +5573,11 @@ impl Host {
         submitting(1, runs.len());
         // With [`heap_sync_first`]: the heaps' records begun now, beside the
         // planning of steps done on the card and the look at flights.
-        let first_heaps = (late && heap_sync_first()).then(crate::descriptor::begin_sync_heaps);
+        // (Port 7 asks for a round at the title's submit instead and waits
+        // for it, which begins after the submit's writes; with it on the
+        // early begin is left out, as its round covers the same concern.)
+        let heaps_on = crate::port_journal::on();
+        let first_heaps = (!heaps_on && late && heap_sync_first()).then(crate::descriptor::begin_sync_heaps);
         #[cfg(feature = "diagnostics")]
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
@@ -5609,17 +5614,27 @@ impl Host {
         // command lists that index those slots are submitted. (Begun first:
         // again after a wait for flights, whose landings wrote title memory,
         // as the round began here saw them; the first is not waited for.)
-        let heaps_synced = match first_heaps {
-            Some(first) if !waited_for_flights => {
-                HEAP_SYNC_FIRST[0].fetch_add(1, Ordering::Relaxed);
-                first
+        // (Port 7: the round asked for when the title submitted it, if that
+        // is known; a wait for flights raises the queue's floor, so the
+        // round waited for begins after the landings too.)
+        let heaps_synced = if heaps_on {
+            match crate::port_journal::needed() {
+                0 => crate::descriptor::begin_sync_heaps(),
+                mark => crate::descriptor::begin_sync_heaps_after(mark),
             }
-            first => {
-                if let Some(first) = first {
-                    HEAP_SYNC_FIRST[1].fetch_add(1, Ordering::Relaxed);
-                    std::mem::forget(first);
+        } else {
+            match first_heaps {
+                Some(first) if !waited_for_flights => {
+                    HEAP_SYNC_FIRST[0].fetch_add(1, Ordering::Relaxed);
+                    first
                 }
-                crate::descriptor::begin_sync_heaps()
+                first => {
+                    if let Some(first) = first {
+                        HEAP_SYNC_FIRST[1].fetch_add(1, Ordering::Relaxed);
+                        std::mem::forget(first);
+                    }
+                    crate::descriptor::begin_sync_heaps()
+                }
             }
         };
         // That list runs first, and is one of the submission's from here on.
@@ -5789,7 +5804,9 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
+        let heaps_began = std::time::Instant::now();
         drop(heaps_synced);
+        crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -7438,6 +7455,11 @@ impl HostList {
                     }
                     batch.fill();
                     batch.title_written();
+                    // Renderer port #7: into a heap's records, the rounds
+                    // asked earlier did not see it.
+                    if crate::descriptor::in_shader_heap(dst, len) {
+                        crate::port_journal::prep_wrote();
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7464,6 +7486,9 @@ impl HostList {
                 }
                 Step::Placed(p) => {
                     let started = std::time::Instant::now();
+                    if crate::descriptor::in_shader_heap(p.dst, p.len) {
+                        crate::port_journal::prep_wrote();
+                    }
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
                     if free {
@@ -7489,6 +7514,8 @@ impl HostList {
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                        // (It may write anywhere, a heap's records too.)
+                        crate::port_journal::prep_wrote();
                     }
                     let _step = crate::timeline::span("a step of ours");
                     work();
