@@ -147,17 +147,21 @@ pub(crate) fn apply(pad: &mut super::gameinput::PadState) {
     let mut velocity = g.take().unwrap_or_default();
     let now = Instant::now();
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    // First poll (or a pause): sample now with a nominal dt, or nothing
+    // would ever unblock the gate and the counts would pile up unsampled.
     let since = last.map(|l| now.duration_since(l)).unwrap_or_default();
-    if since.as_millis() as u64 >= SAMPLE_MIN_MS {
+    let sampled = if last.is_none() || since.as_millis() as u64 >= SAMPLE_MIN_MS {
+        velocity.update(dx, dy, since.as_secs_f32().max(if last.is_none() { 0.008 } else { 0.004 }));
         *last = Some(now);
-        velocity.update(dx, dy, since.as_secs_f32().max(0.004));
+        true
     } else {
         // Too soon: keep the counts for the next sample instead.
         velocity.pending_x += dx;
         velocity.pending_y += dy;
-    }
+        false
+    };
     *g = Some(velocity);
-    if !FEEDING.swap(dx != 0 || dy != 0, Ordering::Relaxed) && (dx != 0 || dy != 0) {
+    if sampled && !FEEDING.swap(dx != 0 || dy != 0, Ordering::Relaxed) && (dx != 0 || dy != 0) {
         tracing::info!("the mouse feeds the stick now (dx={dx}, dy={dy})");
     }
     let (rx, ry) = stick_from_mouse(velocity.x, velocity.y);
