@@ -643,11 +643,20 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool], threads: Option<[u32
                         _ => true,
                     })
                 };
-                // a read of the group's LDS at an address the lanes agree on
+                // a read of the group's LDS at an address the lanes agree on.
+                // Uniform only if no later instruction of the block writes
+                // the LDS: both halves of the read must observe the same
+                // writes for "every lane reads the same dword" to hold
+                // (vitoriabr 809ba50e; the shader uses this for a wave's
+                // running scan, which a ds_write between the reads breaks).
                 if let Fields::Ds { dst: Some(_), addr: Some(addr), gds: false, .. } = &inst.fields
                     && name == "ds_read_b32"
                     && alike_ops(&[*addr], &same)
                     && st.guards[b][i].is_none_or(|g| uniform_bool(g, &same, &cmp, &assumed_m))
+                    && !block.insts[i + 1..].iter().any(|later| {
+                        let later_name = later.name();
+                        later_name.starts_with("ds_") && !later_name.starts_with("ds_read")
+                    })
                 {
                     same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
                     continue;
