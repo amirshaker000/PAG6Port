@@ -508,6 +508,11 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
             }
             continue;
         };
+        // Inline float constants (240..=248) name f16 values on GFX10 in an
+        // f16 op, not f32 bits: 0.5 is 0x3800 there, and decoding 240 as f32
+        // bits (whose low 15 bits are 0) made a wave reduction sum with it
+        // read as a no-op and its result collapse (Marvisak #2493).
+        let f16_inline = name == "v_add_f16";
         let lanes = |op: &Operand,
                      vec: &HashMap<Value, Vec<Sym>>,
                      uni: &HashMap<Value, Sym>|
@@ -525,6 +530,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
                     Some(x) => one(uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
                     None => one(Sym::Unknown),
                 },
+                Operand::Const(c @ 240..=248) if f16_inline => {
+                    let h = [
+                        0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
+                    ][usize::from(c - 240)];
+                    one(Sym::K(h))
+                }
                 Operand::Const(c) => one(crate::resource::inline(c).map_or(Sym::Unknown, Sym::K)),
                 Operand::Literal(x) => one(Sym::K(x)),
                 _ => one(Sym::Unknown),
