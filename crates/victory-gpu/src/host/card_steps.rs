@@ -207,6 +207,33 @@ pub(super) fn copied_read(copies: &[Writer], runs: &[&HostList]) -> bool {
     })
 }
 
+/// (Coder W, diagnostics) [`copied_read`]'s first match, named: the card copy's destination
+/// (its host copy's span) and what reads it (a refresh of another copy, a host step, a plane).
+#[cfg(feature = "diagnostics")]
+pub(super) fn copied_read_who(copies: &[Writer], runs: &[&HostList]) -> Option<String> {
+    let span = |s: &Option<Arc<Shadow>>| s.as_ref().map_or((0, 0), |s| s.span());
+    for list in runs {
+        for step in list.deferred().copies.iter() {
+            let hit = match step {
+                Step::Refresh(shadow, at, len) => copies
+                    .iter()
+                    .find(|w| w.from < *at + *len && *at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, shadow)))
+                    .map(|w| (w, format!("refresh of copy {:#x}+{:#x}", shadow.span().0, shadow.span().1))),
+                Step::Host(_, (from, to)) => copies.iter().find(|w| w.from < *to && *from < w.to).map(|w| (w, "a host step".to_string())),
+                Step::Plane((at, len), _) => {
+                    copies.iter().find(|w| w.from < at.saturating_add(*len) && *at < w.to).map(|w| (w, "a movie plane".to_string()))
+                }
+                _ => None,
+            };
+            if let Some((w, reader)) = hit {
+                let (s, l) = span(&w.shadow);
+                return Some(format!("card copy into {:#x}..{:#x} (copy {s:#x}+{l:#x}) read by {reader}", w.from, w.to));
+            }
+        }
+    }
+    None
+}
+
 /// What a step of a submission does to title memory, as the plan sees it.
 /// `asked`: flights in the air stop it from being done on the CPU now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

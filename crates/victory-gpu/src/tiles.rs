@@ -105,6 +105,75 @@ pub(crate) fn wanted() -> bool {
     })
 }
 
+/// (Fox V, `VICTORY_LEVELS_ALL=1`, default off; only with
+/// [`wanted`]) Every texture that fits this path is made this way, not only
+/// those that do not hold all their levels: those take tiles for every level
+/// at their first upload (`Staging::held_levels` answers all of them).
+pub(crate) fn all_levels() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_LEVELS_ALL").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("every texture that fits takes tiled card memory (VICTORY_LEVELS_ALL=1)");
+        }
+        on
+    })
+}
+
+/// (Fox V, `VICTORY_LEVELS_ALL`) Which test a host copy of a title texture
+/// made with the switch passed or failed first, for [`status`].
+#[derive(Clone, Copy)]
+pub(crate) enum Refused {
+    /// Not a texture the title fills (a target, depth, written by shaders).
+    Fills,
+    /// Not two-dimensional.
+    Dimension,
+    /// An array or cube.
+    Array,
+    /// One level only.
+    OneLevel,
+    /// Multisampled.
+    Samples,
+    /// Not placed in title memory.
+    NotPlaced,
+    /// A layout the upload cannot read (none, or XOR mode).
+    Layout,
+    /// Under the floor ([`floor`]).
+    Small,
+    /// Holds all its levels (without the switch only).
+    Held,
+    /// The card made no reserved texture of it.
+    Reserve,
+    /// The card's tiling of it does not fit ([`Tiled::make`]).
+    Tiling,
+    /// Taken: made tiled.
+    Taken,
+}
+
+const REFUSED: usize = 12;
+const REFUSED_NAMES: [&str; REFUSED] = [
+    "not filled by the title",
+    "not 2D",
+    "array or cube",
+    "one level",
+    "multisampled",
+    "not placed in title memory",
+    "layout not readable",
+    "under the floor",
+    "holds all levels",
+    "no reserved texture",
+    "tiling does not fit",
+    "TAKEN",
+];
+
+/// Since the start, by [`Refused`]: host copies and their bytes.
+static REFUSALS: [[AtomicU64; REFUSED]; 2] = [const { [const { AtomicU64::new(0) }; REFUSED] }; 2];
+
+pub(crate) fn refused(why: Refused, bytes: u64) {
+    REFUSALS[0][why as usize].fetch_add(1, Ordering::Relaxed);
+    REFUSALS[1][why as usize].fetch_add(bytes, Ordering::Relaxed);
+}
+
 fn parse_floor(value: Option<&str>) -> u64 {
     value
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -694,6 +763,16 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
 pub(crate) fn status() {
     static BEFORE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    if all_levels() && wanted() {
+        // (Fox V) Printed at zero too.
+        let mut line = String::from("tiled host copies (VICTORY_LEVELS_ALL=1), since the start, by the first test failed:");
+        for (i, name) in REFUSED_NAMES.iter().enumerate() {
+            let n = REFUSALS[0][i].load(Ordering::Relaxed);
+            let mb = REFUSALS[1][i].load(Ordering::Relaxed) >> 20;
+            line.push_str(&format!(" {name} {n} ({mb} MB);"));
+        }
+        tracing::info!("{line}");
+    }
     if s[4] == 0 {
         return;
     }

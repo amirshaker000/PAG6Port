@@ -1,95 +1,83 @@
 # Scarlett fork (branch `scarlett-fox`), state of 2026-11-26
 
+## How to start the game (the short version)
+
+You need your own dump of the game: a folder that has `game_scarlett_master.exe` in it. **This repository contains
+no game files, code or assets.**
+
+1. **Install the tools once:** [Rust](https://rustup.rs) and the Visual Studio C++ build tools with a Windows SDK.
+2. **Build once.** Open PowerShell in this folder and run:
+
+   ```powershell
+   cargo build --profile diag -p victory --features diagnostics --locked
+   ```
+
+3. **Start the game.** Drag your game folder onto **`Play-Scarlett.cmd`**.
+   After the first time, just double-click `Play-Scarlett.cmd`: it remembers the folder.
+
+That is all. `Play-Scarlett.cmd` sets every setting and memory hook this branch is measured with, in Series X mode.
+
+Good to know:
+
+- **The first start is slow** and can show missing faces: the game's shaders are translated once and kept. From the
+  second start on it is right.
+- **Controls:** an Xbox controller works. On the keyboard: W A S D move, I J K L camera, Enter = A, Backspace = B,
+  X and Y, Z / C = left / right trigger, Q / E = LB / RB, arrows = D-pad, Esc = Menu, Tab = View.
+- **Do not use `Play-VIctory.cmd`** for this: that is the base's launcher, with Series S and other settings.
+- **Ray tracing** is off by default (the game's own, much slower). To turn it on, start it from PowerShell:
+
+  ```powershell
+  .\scripts\play-scarlett.ps1 -RayTracing
+  ```
+
+- **Something looks wrong?** Try without the memory hooks: `.\scripts\play-scarlett.ps1 -NoHooks`
+- More options are listed at the top of `scripts\play-scarlett.ps1` (other cache or save folders, a release build,
+  automatic start-screen presses, any single setting through `-More`).
+
+## What this is
+
 This branch is codec-d/cool_fox at `f4b48ad` (itself avatarmanz/VIctory-7900XTX `0a43566` plus six commits) with the
 work of a local fork ("Scarlett") ported onto it. Target PC: Ryzen 7 9800X3D, 32 GB RAM, RTX 4080 SUPER 16 GB,
 2560x1440, Series X mode. Goal: a stable 30 frames a second with no loss of picture. It is not there yet.
 
-**This repository contains no game files, code or assets.**
+## Measured (6-minute opening route, diagnostics build, ray tracing off)
 
-## Measured (6-minute opening route, diagnostics build)
-
-| | cool_fox as it was (floor) | this branch, best settings |
+| | cool_fox as it was (floor) | this branch, current settings |
 |---|---|---|
-| ms per frame, 1,000-2,500 draws | 50-55 | 41 |
-| ms per frame, 2,500-4,000 draws | 50-53 | 50 |
-| ms per frame, over 4,000 draws | 59-66 | 61 |
-| frames over 1.5x the usual | 7-8 % | 4.3 % |
-| 5-second periods with a frame over 500 ms | 18-21 | 11 |
-| frames drawn in the 6 minutes | 4,400-5,900 | 7,256 |
+| ms per frame, 1,000-2,500 draws | 50-55 | 35 |
+| ms per frame, 2,500-4,000 draws | 50-53 | 44 |
+| ms per frame, over 4,000 draws | 59-66 | 56 |
+| frames over 1.5x the usual | 7-8 % | 2.3 % |
+| 5-second periods with a frame over 500 ms | 18-21 | 10 |
+| frames drawn in the 6 minutes | 4,400-5,900 | 8,385 |
+| texture copies made again in the first 4 minutes | about 6.4 GB | 14 MB |
+| memory commit, peak | 37 GB | 33 GB |
 
-A heavier hand-played scene (5,500-8,600 draws) runs at about 70 ms. Memory commit is about 36.5 GB.
+Heavier hand-played scenes (a prison yard at 5,500-8,600 draws, the open world) run at about 48-62 ms a frame
+(16-21 fps). Identical runs on the test PC differ by 13-18 ms a frame at the same draw count, so single-run frame
+times prove little; the memory, re-upload and freeze figures and each switch's own counter line are what is solid.
 
-## Run it as in run-118
+Where the time goes now (ray tracing off): the graphics card is mostly idle. One thread of the layer, the one that
+hands each frame's work to the card, is busy for the whole frame (32-44 ms: buffer refreshes 12-14, copies in the
+card's memory 7-8, other list steps about 6, write-watch asks about 4).
 
-Settings are environment variables read at start. In PowerShell, from the repository folder, after the build below:
+## The settings `Play-Scarlett.cmd` uses
 
-```powershell
-$env:VICTORY_GAME_DIR  = 'D:\Games\MyDump'          # your own dump: the folder with game_scarlett_master.exe
-$env:VICTORY_CACHE_DIR = 'D:\VIctory\cache'         # shader and pipeline caches (a first run fills them and is slow)
-$env:VICTORY_DATA_DIR  = 'D:\VIctory\data'          # saves
-$set = @'
-VICTORY_JOIN_COPIES=1 VICTORY_REFRESH_ONCE=1 VICTORY_CARD_REHASH_RUNS=1 VICTORY_BACK_OWN_VIEW=1 VICTORY_WIDE_MERGE=1
-VICTORY_LEVELS_ON_DEMAND=1 VICTORY_MIRROR_FAST=1 VICTORY_FRAME_LOG=1 VICTORY_CARD_METER=1 VICTORY_PIPELINE_WAIT_MS=20
-VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_COPY_PLAIN=1
-VICTORY_WIDE_TEXTURES=1 VICTORY_INDIRECT_GATHER=1 VICTORY_LATE_WAIT_LISTS=1024 VICTORY_CARD_FILLS_BATCH=0
-VICTORY_GATHER_DISPATCH=0
-VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_RELAY_COPY=1 VICTORY_CARD_STEPS=2 VICTORY_INDIRECT_BATCH=2
-VICTORY_MAP_THREADS=1 VICTORY_CARD_AWAKE=1 VICTORY_SHOW_AFTER=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1
-VICTORY_CARD_BUFFERS_MIN_KB=64
-VICTORY_POOL_DISCARD=1 VICTORY_FILL_TITLE=1 VICTORY_PARTIAL_DELTA=1
-'@
-$set -split '\s+' | Where-Object { $_ } | ForEach-Object { $k, $v = $_ -split '=', 2; Set-Item "Env:$k" $v }
-.\target\diag\victory.exe run "$env:VICTORY_GAME_DIR\game_scarlett_master.exe" --execute
-```
+All settings are environment variables read at start; `scripts\play-scarlett.ps1` holds the list, in groups:
 
-That is the exact set run-118 was started with: the first block is this fork's standing run set (some of its names
-are from the older tree and are ignored here), the second is cool_fox's launcher set without `VICTORY_THIN` and the
-stand-in ambient light, the third is the three switches that made the difference. Do **not** use `Play-VIctory.cmd`
-for this: it selects Series S and other settings. The start screens need pad or keyboard input (Enter = A, arrows =
-D-pad); for a hands-off run add `VICTORY_AUTO_INPUT` as in `tools/run-auto.sh`.
-
-Build: `cargo build --profile diag -p victory --features diagnostics --locked` (the pinned toolchain in
-`rust-toolchain.toml`, MSVC build tools and a Windows SDK).
-
-## Run it as in run-128 (run-118 plus the memory set)
-
-Same as above, with these added to `$set` before the `-split` line (everything else, the build and the launch line,
-unchanged):
-
-```powershell
-$set += @'
-
-VICTORY_BAKE_DELTA=1 VICTORY_MAP_LOCK_FINE=1
-VICTORY_STAGING_REST_MS=250 VICTORY_STAGING_PACK=1 VICTORY_SEND_SPARE_MB=128
-VICTORY_WINDOW_KB=1024 VICTORY_WINDOW_TAILS=1 VICTORY_HEAP_PACK=1 VICTORY_LIST_POOL_IDLE_S=10
-VICTORY_HOLDERS=1 VICTORY_MEMORY_MAP=6
-'@
-```
-
-What the additions do: a bake no longer uploads unchanged source textures again (`BAKE_DELTA`); a page-mapping call
-blocks only readers of the range it changes (`MAP_LOCK_FINE`); staging blocks are released after 250 ms and packed;
-the spare of send buffers is cut from about 768 MB to 128 MB; windows of title memory are sized to what is asked and
-their unused tails released; texture pieces go into the fullest block; idle command lists are let go after 10 s. The
-last line only adds two meters (which buffers sit in the large allocations; the address-space walk).
-
-### run-128 against run-118
-
-| | run-118 set | run-128 set |
-|---|---|---|
-| Opening route: memory commit, median / peak | 32.5 / 36.5 GB | 32.0 / 35.7 GB |
-| Opening route: free RAM, mean | 4.5-5.6 GB | 6.1 GB |
-| Opening route: ms per frame at 1-2.5k / 2.5-4k / over 4k draws | 41 / 50 / 61 | 58 / 70 / 76 |
-| Opening route: 5-second periods with a frame over 500 ms | 11 | 10 |
-| Prison scene (hand-played, 5.5-8.6k draws): ms per frame | about 70 | about 70 |
-| Prison scene: frames over 1.5x the usual | 4.8 % | 2.7 % |
-| Prison scene: memory commit, median / peak | 34.4 / 36.2 GB | 32.7 / 34.0 GB |
-
-Read the frame times with care: the same build and settings measured twice on this PC gave 49 and 62 ms at 2,500-4,000
-draws (runs 121 and 126), so differences under about 15 ms between single runs prove nothing; run-128's higher figures
-on the opening route are inside that band. What is solid: the memory figures (commit does not swing between runs) and
-each switch's own counter line. So run-128 is the lower-memory set at the same speed as far as can be told; run-118 is
-the set with the fewest moving parts. In the prison scene the card is the limit (90-96 % busy), which neither set
-changes.
+- cool_fox's launcher set, **without** Series S, `VICTORY_THIN` and the stand-in ambient light, and with the
+  keep-the-card-busy loop off (`VICTORY_CARD_AWAKE=0`: it held the card at 97-99 % in menus for no gain).
+- `VICTORY_LEVELS_ON_DEMAND=0`: textures keep only the levels their views show. cool_fox's launcher set it to 1,
+  which made every texture keep its whole chain on the card. Off: re-uploads near zero, about 4 GB less commit,
+  fewer freezes. This was the largest single gain.
+- The memory hooks (`-NoHooks` starts without them).
+- `VICTORY_POOL_DISCARD=1`, `VICTORY_FILL_TITLE=1`, `VICTORY_PARTIAL_DELTA=1`, `VICTORY_BAKE_DELTA=1`,
+  `VICTORY_MAP_LOCK_FINE=1`, `VICTORY_POOL_CAP=1`: unused pool pages given back under low RAM, no read waits for
+  fills, unchanged texture levels not uploaded again, the mapping lock taken per range, the texture pool capped.
+- `VICTORY_TABLE_MEMO=1`: a descriptor-table entry made ready earlier in a command list is not made ready again
+  (81 % of about 54,000 entries a frame; verified against the full path). `VICTORY_LIST_ALIAS_EXACT=1`: a texture
+  read through a view in another format follows its source's writes within a list (the base read a stale copy once
+  a frame in the title's lighting filter).
 
 ## What was added to cool_fox
 
@@ -103,45 +91,48 @@ Always on:
   after an upload earlier in the same list, views keep the title's minimum LOD. 26 compute programs the base refused
   now translate (hair shadow masks, water volumetrics, particle emits, decals).
 - Meters (diagnostics builds): uploads by cause, read waits by reason, mapping-lock readers, memory housekeeping,
-  texture detail, the game's chunk pool.
+  texture detail, the game's chunk pool, page kinds by the title's own table, per-pass GPU times
+  (`VICTORY_PASS_TIMES=1`, `=2` serial), list calls and draw set-up by part (`VICTORY_LIST_CALLS=1`).
 
-Switches, off by default (the base's behaviour is kept unless a run showed a gain):
-- `VICTORY_POOL_DISCARD=1` — unused pool pages are given back when free RAM is low; halves the cost of the game's
-  page-mapping calls and the number of freezes. In the best set.
-- `VICTORY_PARTIAL_DELTA=1` — when more of a texture maps, only the levels and slices that differ from the last
-  upload are sent again. In the best set.
-- `VICTORY_FILL_TITLE=1` — cool_fox's own switch; removes 15-24 ms a frame of waits to read title memory behind
-  flights. In the best set.
-- `VICTORY_REFRESH_ONCE=1` (+`=verify`) — part of the standing run set, so it was on in every measured run,
-  the floor included.
-- `VICTORY_BAKE_DELTA=1`, `VICTORY_MAP_LOCK_FINE=1`, `VICTORY_STAGING_REST_MS`, `VICTORY_STAGING_PACK=1`,
-  `VICTORY_SEND_SPARE_MB`, `VICTORY_WINDOW_KB` / `VICTORY_WINDOW_TAILS=1`, `VICTORY_HOLDERS=1` - the memory and
-  upload set of run-128 (see above): about 1 GB less commit on the opening route, about 2 GB less in the prison
-  scene; bake uploads of unchanged textures go to zero; no reader waits on the mapping lock.
-- `VICTORY_MAP_DEFER`, `VICTORY_REMAP_SAME`, `VICTORY_DSTORAGE_OLDEST_FIRST`, `VICTORY_DSTORAGE_WORKERS`,
-  `VICTORY_AFFINITY=free`, `VICTORY_HEAP_PACK`, `VICTORY_STAGING_SPARE_BLOCKS`, `VICTORY_CHUNK_FINAL`, `VICTORY_CHUNK_COUNT`, `VICTORY_BIND_FILTER`, `VICTORY_PREPARE_WIDE`,
-  `VICTORY_WAVE_PAIRS_FIRST`, `VICTORY_ONE_MODE_PER_REGISTER`, `VICTORY_HOIST_LOADS`: ported or new; no gain shown
-  yet, or untested. Tried and rejected on this base: `VICTORY_UNMAP_EXACT`, `VICTORY_TEXTURE_RAM_CAPS=0`,
-  `VICTORY_VRAM_RAW_PCT`.
+Switches, off by default (the base's behaviour is kept unless a run showed a gain); the ones in the launcher are
+described above. Others:
+- `VICTORY_PAGE_POOL=1`: textures on pages of reserved resources (about 1.2 GB less texture memory, no frame cost).
+  Its page mover `VICTORY_PAGE_MIGRATE` loses the device on the test card and must stay off (`tools/docs/fox-port-V.md`).
+- `VICTORY_STAGING_REST_MS`, `VICTORY_STAGING_PACK`, `VICTORY_SEND_SPARE_MB`, `VICTORY_WINDOW_KB`,
+  `VICTORY_WINDOW_TAILS`, `VICTORY_HOLDERS`: memory trims; about 1-2 GB less commit, not in the launcher.
+- `VICTORY_CLEAN_STAMP`, `VICTORY_ASK_KEPT_EARLY`, `VICTORY_FILL_FROM_PLACED`, `VICTORY_SIGNATURE_LOCAL`,
+  `VICTORY_BIND_SAME`, `VICTORY_LIST_BATCH`, `VICTORY_FAULT_NOTE_ONCE`, `VICTORY_BASE_REUSE`, `VICTORY_MAP_DEFER`,
+  `VICTORY_REMAP_SAME`, `VICTORY_CHUNK_FINAL`, `VICTORY_BIND_FILTER`, `VICTORY_HOIST_LOADS` and more: built, exact,
+  no gain shown (or a loss: `VICTORY_LIST_BATCH`), or untested. `tools/docs` says which.
+- Tried and rejected on this base: `VICTORY_THIN=1` (no gain here, twice the long frames), `VICTORY_WINDOWS_BAR_MB`
+  (game memory in VRAM through Resizable BAR: no gain while the card is idle, 1.4 GB of VRAM), a release build
+  without diagnostics (no faster), `VICTORY_DISPLAY_MODE=2560x1440` (the title still builds its 4K targets),
+  `VICTORY_SHADER_LOOP_LIMIT=1024` (black faces), `VICTORY_BVH_COUNT32` (breaks ray tracing), `VICTORY_UNMAP_EXACT`,
+  `VICTORY_TEXTURE_RAM_CAPS=0`, `VICTORY_VRAM_RAW_PCT`.
 
 ## Known problems
 
-- Bushes and some trees glow purple; purple patches linger for a few seconds in some scenes (present in the base).
-- Measured frame times vary by 13-18 ms between identical runs on the test PC; see the note under the run-128
-  table.
-- Texture pop-in: about 46 GB of texture copies are let go and 10 GB made again in six minutes; the card's 64 MB
-  pool blocks hold about 3 GB of holes.
-- About 80 s of a 6-minute run is spent in frames over 150 ms: mostly the game's page-mapping calls under low free
-  RAM, and bursts of texture uploads.
-- Some draws are dropped each frame for lack of a host pipeline (44-164 on the opening route, about 500 in heavy
-  scenes; cause not yet found). Two pipeline creation methods are not implemented (the title falls back to ordinary
-  containers). Ray-tracing acceleration structures are not built.
+- Bushes and some trees glow purple; purple patches linger for a few seconds in some scenes (present in the base;
+  cause not found: `tools/docs/left-out-audit.md` lists the candidates).
+- Meshes can stretch for a second or two in busy scenes (seen before today's changes; another fork blames
+  `VICTORY_RELAY=2` with `VICTORY_CARD_STEPS=2`; not yet tested here).
+- Ray tracing is off by default: the base leaves the title's ray passes out unless `VICTORY_BVH_BUILDER=1`
+  (`CS_RaytracingResolve`, about 1,000 programs, and `CS_ScreenProbes_ActivateRays`). Those are all of the draws the
+  log reports as dropped. With it on the picture is sharper and better lit, and the card needs about 84 ms a frame
+  (`tools/docs/rt-parked-T.md`).
+- Heavy scenes sit at 16-21 fps: the layer's submitting thread is the limit (see above).
+- Texture pop-in remains, less than before; the card reaches 14-15 GB of 16 in long sessions.
+- A first run on an empty shader cache can show missing or black faces.
+- In Series X mode the title always renders at 2560x1440 and upscales to 3840x2160 itself.
+- Two pipeline creation methods are not implemented (the title falls back to ordinary containers).
 
 ## Where things are
 
-- `tools/` — the run scripts (`run-auto.sh`: hands-off 6-minute run with watchdog; `run-compare.sh`,
+- `Play-Scarlett.cmd`, `scripts/play-scarlett.ps1`: the launcher.
+- `tools/`: the measuring scripts (`run-auto-coolfox.sh`: hands-off run with watchdog; `run-compare.sh`,
   `run-freezes.sh`, `run-focus.sh`), notes (`tools/docs`: what was measured, tried and rejected; `fox-port-*.md` list
-  every ported switch), `tools/baseline-coolfox/README.md` (the floor and how to compare against it).
+  every ported switch; `cool-fox-willy-review.md` and `left-out-audit.md`: a settings audit and what the layer
+  leaves out or approximates), `tools/baseline-coolfox/README.md` (the floor and how to compare against it).
 - The older Scarlett tree (soldsawn/victory-nvidia-8gb base) is on branch `scarlett`.
 
 The base's own README follows.

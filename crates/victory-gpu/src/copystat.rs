@@ -902,7 +902,7 @@ fn log_memory() {
             .collect::<Vec<u64>>();
         tracing::info!(
             "memory, windows made: {} in the last 5 s {:.0} MB, {} let go in the last 5 s; {} made since the start \
-             {:.0} MB (VICTORY_WINDOW_KB={} VICTORY_WINDOW_TAILS={})",
+             {:.0} MB (VICTORY_WINDOW_KB={} VICTORY_WINDOW_TAILS={}); {} let go while inside another window since the start              (VICTORY_WINDOW_COVERED={})",
             d[0],
             mb(d[1]),
             d[2],
@@ -910,6 +910,8 @@ fn log_memory() {
             mb(made[1]),
             std::env::var("VICTORY_WINDOW_KB").unwrap_or_else(|_| "4096".into()),
             std::env::var("VICTORY_WINDOW_TAILS").unwrap_or_else(|_| "0".into()),
+            crate::shadow::COVERED_LET_GO.load(Relaxed),
+            u8::from(crate::shadow::window_covered()),
         );
     }
     tracing::info!(

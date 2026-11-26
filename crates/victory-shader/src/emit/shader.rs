@@ -29,6 +29,14 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Kept distinct from [`SLOT_STRIDES`] so the host binds the table without
 /// running the full bindless heap buffer sweep.
 pub const SLOT_TABLE_STRIDES: u8 = 252;
+/// (Fox T, diagnostics meter `VICTORY_BVH_WALK=1`) The root UAV `u<SLOT_WALK>` in
+/// [`ROOT_CBV_SPACE`]: [`WALK_SLOTS`] dwords, one per thread of a dispatch (its
+/// `SV_DispatchThreadID` x + 4096 y, modulo the slots); each ray-tracing node test a
+/// thread runs adds 1 (a box node) or 0x10000 (a triangle) to its dword. The host reads
+/// the buffer back after each dispatch that has it.
+pub const SLOT_WALK: u8 = 251;
+/// Dwords of the [`SLOT_WALK`] buffer.
+pub const WALK_SLOTS: u32 = 1 << 22;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format

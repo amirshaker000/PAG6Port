@@ -307,6 +307,17 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
     is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
+/// (Fox T, diagnostics) The name the pass times (`VICTORY_PASS_TIMES`) sum
+/// the title pipeline `this`'s draws and dispatches under.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn label(this: This) -> Arc<str> {
+    if this.is_null() {
+        return Arc::from("no pipeline");
+    }
+    let p = pipeline(this);
+    p.host.label(p.builder)
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
@@ -543,13 +554,36 @@ pub(crate) fn note_drop(this: This) {
         Some("no pipeline set".to_owned())
     } else {
         let p = pipeline(this);
-        skipped_shader(p)
-            .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
+        skipped_shader(p).map(|hash| format!("skipped shader {hash}")).or_else(|| {
+            let why = make::missing(&p.host);
+            if why.is_some() {
+                make::note_dropped(&p.host);
+            }
+            why
+        })
     };
     if let Some(why) = why {
         note_why(why);
     }
+}
+
+/// (Fox P, diagnostics) Counts a dispatch (`indirect`: an indirect one) of
+/// `this` run or dropped, if it is of a program left out by name.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_family(this: This, indirect: bool, ran: bool) {
+    if this.is_null() {
+        return;
+    }
+    if let Some(f) = pipeline(this).host.family {
+        make::FAMILY_RUNS[f][usize::from(indirect) * 2 + usize::from(!ran)]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// (Fox P, diagnostics) The pending-pipelines lines (`make::report`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn pending_report(frames: f64) {
+    make::report(frames);
 }
 
 /// Counts a draw or dispatch dropped for `why` (diagnostics).

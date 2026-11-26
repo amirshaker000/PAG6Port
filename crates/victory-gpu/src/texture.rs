@@ -101,6 +101,10 @@ pub(crate) struct Staging {
     /// (C3) `VICTORY_PARTIAL_DELTA=1`: which subresources the list's copy
     /// leaves out ([`delta`]).
     delta: Mutex<Option<delta::Plan>>,
+    /// (coder K, `VICTORY_GPU_ONLY=1` safety net) The journal's asking count when the running refresh began,
+    /// and when the staging buffer was last detiled: a known write noted after that is not in it.
+    fill_began: std::sync::atomic::AtomicU64,
+    filled_at: std::sync::atomic::AtomicU64,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -1344,6 +1348,11 @@ impl Staging {
             hash = None;
         }
         *self.holds.lock().unwrap_or_else(|e| e.into_inner()) = hash.map(|hash| (self.first, hash));
+        // (coder K) For the safety net: what the host copy holds was read at or after this asking.
+        if let Some(hash) = hash {
+            crate::pagekinds::held(self.serial, self.filled_at.load(std::sync::atomic::Ordering::Relaxed));
+            crate::pagekinds::uploaded_at(self.memory as u64, self.read as u64, hash);
+        }
     }
 
     /// (C3, `VICTORY_BAKE_DELTA`) Whether nothing has written the texture's
@@ -1414,15 +1423,27 @@ impl Staging {
         if alone && !exact && last.hash.is_some() {
             return 0;
         }
+        self.fill_began.store(crate::watch::asking_now(), std::sync::atomic::Ordering::Relaxed);
+        // (coder K, `VICTORY_GPU_ONLY=1`) All on pages the title keeps GPU-only: the journal answers.
+        let untracked = !alone && crate::pagekinds::exempt(start, start + size);
         if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if !exact && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                if untracked {
+                    crate::pagekinds::refresh_spared(start, size, last.hot_until);
+                }
                 return 0;
             }
             last.asked = now;
+            // (coder K) Read after this asking: every note in its answer is in the bytes.
+            self.fill_began.store(now, std::sync::atomic::Ordering::Relaxed);
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                // (coder K) What the host copy is to hold, for the safety net and `unchanged`.
+                if untracked {
+                    last.hash = Some(digest(read));
+                }
                 self.detile(read);
             });
             #[cfg(feature = "diagnostics")]
@@ -1634,6 +1655,7 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.filled_at.store(self.fill_began.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1789,11 +1811,22 @@ pub(crate) fn unchanged(resource: This, first: u32) -> bool {
         return false;
     }
     let size = layout.bytes_from(from) as usize;
+    // (coder K, `VICTORY_GPU_ONLY=1`) All on pages the title keeps GPU-only, and no known write since the held
+    // bytes were read: unchanged, nothing read.
+    if let Some(same) = crate::pagekinds::unchanged_by_rule(memory as usize, size, copy.serial) {
+        return same;
+    }
+    let asked = crate::watch::asking_now();
     with_read(size, |read| {
         if crate::host::read_there(memory, read) == 0 {
             return false;
         }
-        digest(read) == held
+        let same = digest(read) == held;
+        // (coder K) What the copy holds is what title memory held at this asking.
+        if same {
+            crate::pagekinds::held(copy.serial, asked);
+        }
+        same
     })
 }
 
@@ -2129,6 +2162,8 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         waiting: std::sync::atomic::AtomicU64::new(0),
         exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
         delta: Mutex::new(None),
+        fill_began: std::sync::atomic::AtomicU64::new(0),
+        filled_at: std::sync::atomic::AtomicU64::new(0),
     });
     map.insert(resource as usize, s.clone());
     Some(s)

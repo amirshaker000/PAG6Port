@@ -593,6 +593,7 @@ unsafe fn piece_at(
     // The pages that differ, before any is written: none, and the guard
     // stays; else it is opened once for the piece.
     let mut differing = [true; BLOCK / PAGE + 1];
+    let mut direct_span = (0usize, 0usize);
     let base = title / PAGE;
     if beside.is_none() {
         drop(reading);
@@ -611,6 +612,7 @@ unsafe fn piece_at(
         let (from, to) = (((base + first) * PAGE).max(title), ((base + last + 1) * PAGE).min(title + end));
         let opening = std::time::Instant::now();
         crate::watch::landing(from, to - from);
+        direct_span = (from, to);
         spent(stat::NOTES, opening);
     }
     let into = beside.unwrap_or(title);
@@ -660,6 +662,11 @@ unsafe fn piece_at(
             }
         }
     });
+    // (Coder J, `VICTORY_KNOWN_WRITES`) Put straight into title memory: noted
+    // again now the bytes are in (`watch::landing` above notes before them).
+    if direct_span.0 < direct_span.1 {
+        crate::knownwrites::landed(direct_span.0, direct_span.1 - direct_span.0);
+    }
     if let Some((from, to)) = span {
         notes.spans.push((from, to - from));
         // Not through a copy that is not to be noted, if that is asked: the

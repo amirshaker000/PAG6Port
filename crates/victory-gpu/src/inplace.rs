@@ -337,6 +337,12 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
             let shown = v.pages.entry((section, offset + (k * K64) as u64)).or_default();
             shown.push(at + k * K64);
             let twice = shown.len() == 2;
+            // (coder K, `VICTORY_GPU_ONLY=1`) Every address of a page shown more than once.
+            if shown.len() >= 2 {
+                for &a in shown.iter() {
+                    TWICE.set(a / K64);
+                }
+            }
             v.pages_twice += usize::from(twice);
         }
     }
@@ -368,6 +374,10 @@ pub(crate) fn views_gone(at: usize, len: usize) {
                 let before = pages.len();
                 pages.retain(|&shown| shown != page);
                 let after = pages.len();
+                TWICE.clear(page / K64);
+                if after == 1 {
+                    TWICE.clear(pages[0] / K64);
+                }
                 if after == 0 {
                     v.pages.remove(&key);
                 }
@@ -375,6 +385,41 @@ pub(crate) fn views_gone(at: usize, len: usize) {
             }
         }
     }
+}
+
+/// (coder K, `VICTORY_GPU_ONLY=1`) The 64 KiB blocks of addresses whose page the title shows at another
+/// address too (a write through that one would change it unseen): never exempt from tracking.
+static TWICE: crate::watch::Bits = crate::watch::Bits::new();
+
+/// Whether a block of `[first, last)` (64 KiB blocks) shows a page shown elsewhere too.
+pub(crate) fn shown_twice(first: usize, last: usize) -> bool {
+    TWICE.any(first, last)
+}
+
+/// (coder K) What the record says `at` shows: section and the 64 KiB page's offset in it.
+pub(crate) fn key_of(at: usize) -> Option<(usize, u64)> {
+    let v = views();
+    let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
+    let within = at.wrapping_sub(base);
+    (within < bytes).then(|| (section, offset + (within / K64 * K64) as u64))
+}
+
+/// (coder K) The other addresses the record says show the page at `page` (64 KiB aligned), each with whether
+/// the record's view there really shows that page now (`false`: a stale entry).
+pub(crate) fn other_views(page: usize) -> Vec<(usize, bool)> {
+    let v = views();
+    let key_at = |at: usize| -> Option<(usize, u64)> {
+        let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
+        let within = at.wrapping_sub(base);
+        (within < bytes).then(|| (section, offset + (within / K64 * K64) as u64))
+    };
+    let Some(key) = key_at(page) else {
+        return Vec::new();
+    };
+    v.pages
+        .get(&key)
+        .map(|shown| shown.iter().filter(|&&a| a != page).map(|&a| (a, key_at(a) == Some(key))).collect())
+        .unwrap_or_default()
 }
 
 /// The 64 KiB pages of `[start, end)` that the title shows at other
@@ -1300,6 +1345,21 @@ mod tests {
         assert_eq!(runs(0, 2 * K64), vec![(at, K64)]);
         super::views_gone(at, 8 * K64);
         assert_eq!(shown(0, 8 * K64), None);
+    }
+
+    /// (coder K) A page shown at two addresses is shown twice at both until one view goes.
+    #[test]
+    fn pages_shown_twice_are_known_at_every_address() {
+        const K64: usize = 64 << 10;
+        let (a, b) = (0x7ff2_0000_0000_usize, 0x7ff3_0000_0000_usize);
+        super::title_memory_view(a, 2 * K64, 4242, 0);
+        assert!(!super::shown_twice(a / K64, a / K64 + 2));
+        super::title_memory_view(b, K64, 4242, K64 as u64);
+        assert!(!super::shown_twice(a / K64, a / K64 + 1));
+        assert!(super::shown_twice(a / K64 + 1, a / K64 + 2) && super::shown_twice(b / K64, b / K64 + 1));
+        super::views_gone(b, K64);
+        assert!(!super::shown_twice(a / K64, a / K64 + 2) && !super::shown_twice(b / K64, b / K64 + 1));
+        super::views_gone(a, 2 * K64);
     }
 
     #[test]

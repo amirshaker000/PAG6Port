@@ -48,11 +48,24 @@ pub(crate) struct Pending {
     scene_input: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
+    /// (Fox P) Which of the programs left out by name ([`FAMILIES`]) it is
+    /// one of, made or not: for the per-frame counters.
+    pub(crate) family: Option<usize>,
+    /// (Fox P, diagnostics) When it was first queued, its draws and
+    /// dispatches dropped since the last report, and whether the report
+    /// already follows it ([`note_dropped`]).
+    queued_at: OnceLock<Instant>,
+    drops: AtomicU64,
+    followed: AtomicBool,
     /// (fxceless a35c557) The formats its state declares for what a draw draws into
     /// (zeros without a graphics state), and the same shaders and state for other formats
     /// bound at a draw ([`for_formats`]): a chain, one link per set of formats met.
     pub(crate) formats: TargetFormats,
     variant: OnceLock<Arc<Pending>>,
+    /// (Fox T, diagnostics) Its programs' names for the pass times
+    /// (`VICTORY_PASS_TIMES`), made on first use ([`Pending::label`]).
+    #[cfg(feature = "diagnostics")]
+    label: OnceLock<Arc<str>>,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -61,19 +74,39 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
-fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+/// (Fox P) The programs [`left_out`] leaves out by name, the only such list in
+/// this tree: one per material (`billboard_nobump:CS_RaytracingResolve_*`,
+/// `cloth_default:...`; ~1,000) that shades the hits of the title's rays, and
+/// the screen probes' program that activates their rays.
+pub(crate) const FAMILIES: [&str; 2] = ["CS_RaytracingResolve", "CS_ScreenProbes_ActivateRays"];
+
+/// (Fox P, diagnostics) Per family: dispatches run, dropped; indirect ones
+/// run, dropped; since the last report.
+#[cfg(feature = "diagnostics")]
+pub(crate) static FAMILY_RUNS: [[AtomicU64; 4]; 2] = [const { [const { AtomicU64::new(0) }; 4] }; 2];
+
+fn family(shaders: &[Arc<Shader>]) -> Option<usize> {
+    FAMILIES.iter().position(|name| named(shaders, name.as_bytes()))
+}
+
+fn left_out(family: Option<usize>) -> Option<&'static str> {
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return false;
-        }
         // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
         // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
-        std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0")
+        let skip = !builder && std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0");
+        tracing::info!(
+            left_out = skip,
+            builder,
+            "programs left out by name: CS_RaytracingResolve (shades the hits of the title's rays, one per material) \
+             is left out while the ray-tracing structure builder is off (VICTORY_BVH_BUILDER=1 or VICTORY_RT_RESOLVE=1: made); \
+             its dispatches count as 'left out by name', not 'being made'"
+        );
+        skip
     });
-    if skip_rt && named(shaders, b"CS_RaytracingResolve") {
-        return Some("shades ray-tracing hits without BVH, left out");
+    if skip_rt && family == Some(0) {
+        return Some("shades ray-tracing hits without BVH, left out (VICTORY_RT_RESOLVE=1: made)");
     }
     static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
     let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
@@ -83,8 +116,8 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         }
         std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
     });
-    if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
-        return Some("ray activation shader without BVH, left out");
+    if skip_activate && family == Some(1) {
+        return Some("ray activation shader without BVH, left out (VICTORY_ACTIVATE_RAYS=1: made)");
     }
     None
 }
@@ -123,8 +156,13 @@ impl Pending {
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
-        let left_out = left_out(&shaders);
+        let family = family(&shaders);
+        let left_out = left_out(family);
         Pending {
+            family,
+            queued_at: OnceLock::new(),
+            drops: AtomicU64::new(0),
+            followed: AtomicBool::new(false),
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
             variant: OnceLock::new(),
             screen,
@@ -137,7 +175,28 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            #[cfg(feature = "diagnostics")]
+            label: OnceLock::new(),
         }
+    }
+
+    /// (Fox T, diagnostics) What the pass times call it: each stage's
+    /// program name as its container carries it (`group:CS_Name_hash`), or
+    /// the stage and hash where it carries none; `builder` puts
+    /// `bvh-builder` in front (the console's structure builder's stages).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn label(&self, builder: bool) -> Arc<str> {
+        self.label
+            .get_or_init(|| {
+                let parts: Vec<String> = self
+                    .shaders
+                    .iter()
+                    .map(|s| program_name(&s.container).unwrap_or_else(|| format!("{} {}", s.stage, s.hash)))
+                    .collect();
+                let text = parts.join(" + ");
+                Arc::from(if builder { format!("bvh-builder {text}") } else { text })
+            })
+            .clone()
     }
 
     pub(super) fn key(&self) -> &str {
@@ -149,6 +208,12 @@ impl Pending {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            // (Fox P) A creation that fails is final: `made` holds `None`
+            // (the reason was logged by `HostPipeline::new`), never "being made".
+            if made.is_none() {
+                FAILED.fetch_add(1, Ordering::Relaxed);
+            }
+            MADE_RECENT.fetch_add(1, Ordering::Relaxed);
             made
         });
         let (lock, done) = &DONE;
@@ -161,8 +226,18 @@ impl Pending {
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    // (Fox P) A pipeline left out by name is never queued and never made: it
+    // was counted as "being made" for whole runs (~600 dispatches a frame).
+    if let Some(why) = p.left_out {
+        return Some(format!("left out by name: {}", FAMILIES[p.family.unwrap_or(0)]) + ", " + why);
+    }
     match p.made.get() {
         Some(Some(_)) => None,
+        // (Fox P) Never queued: the draw went to a variant for its bound
+        // formats (`for_formats`), which is what is not there.
+        None if p.queue_state.load(Ordering::Relaxed) == NOT_QUEUED => {
+            Some("its variant for the bound render target formats is not there (VICTORY_TARGET_VARIANTS)".into())
+        }
         None => Some("being made".into()),
         Some(None) => {
             let failed: Vec<String> = p
@@ -425,11 +500,17 @@ struct Queue {
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
     requested: VecDeque<Arc<Pending>>,
+    /// (Fox P, diagnostics) Every pipeline queued and not seen made yet by
+    /// [`report`].
+    #[cfg(feature = "diagnostics")]
+    all: Vec<Arc<Pending>>,
 }
 
 impl Queue {
     const fn new() -> Self {
         Self {
+            #[cfg(feature = "diagnostics")]
+            all: Vec::new(),
             screen: VecDeque::new(),
             early: VecDeque::new(),
             slow: VecDeque::new(),
@@ -503,6 +584,11 @@ fn start(p: &Arc<Pending>, priority: u8) {
     if let Some(new) = queue.push(p, priority) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                let _ = p.queued_at.set(Instant::now());
+                queue.all.push(p.clone());
+            }
         }
         // (One woken could be a worker that takes passes over the screen
         // alone: it would leave the pipeline to nobody.)
@@ -552,6 +638,7 @@ fn workers() -> bool {
         );
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
+        WORKERS.store((workers + screens) as u64, Ordering::Relaxed);
         for i in 0..workers + screens {
             let screens_only = i >= workers;
             let spawned = std::thread::Builder::new()
@@ -569,7 +656,21 @@ fn workers() -> bool {
                     }
                     loop {
                         let p = next(screens_only);
-                        p.make();
+                        BUSY.fetch_add(1, Ordering::Relaxed);
+                        // (Fox P) A creation that panics (translator or
+                        // driver wrapper) would end this worker and leave the
+                        // pipeline "being made" for good: it is made final
+                        // without a host pipeline instead, and said once.
+                        let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.make()));
+                        if made.is_err() {
+                            FAILED.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!(shaders = ?p.shaders, "a host pipeline's creation panicked: it goes without one");
+                            let _ = p.made.set(None);
+                            let (lock, done) = &DONE;
+                            let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+                            done.notify_all();
+                        }
+                        BUSY.fetch_sub(1, Ordering::Relaxed);
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                             queue.slow_now -= 1;
@@ -594,6 +695,151 @@ fn workers() -> bool {
 
 /// The most pipelines waiting at once since the workers last ran out.
 static PEAK: AtomicU64 = AtomicU64::new(0);
+
+/// (Fox P) Creations that ended without a host pipeline since the start;
+/// creations ended since the last [`report`]; workers making one now, of all.
+static FAILED: AtomicU64 = AtomicU64::new(0);
+static MADE_RECENT: AtomicU64 = AtomicU64::new(0);
+static BUSY: AtomicU64 = AtomicU64::new(0);
+static WORKERS: AtomicU64 = AtomicU64::new(0);
+
+/// (Fox P, diagnostics) Pipelines whose draws or dispatches were dropped,
+/// followed by [`report`] until they are made and drop nothing.
+#[cfg(feature = "diagnostics")]
+static DROPPERS: Mutex<Vec<Arc<Pending>>> = Mutex::new(Vec::new());
+
+/// (Fox P, diagnostics) Counts a draw or dispatch of `p` dropped for want of
+/// its host pipeline.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_dropped(p: &Arc<Pending>) {
+    p.drops.fetch_add(1, Ordering::Relaxed);
+    if !p.followed.load(Ordering::Relaxed) && !p.followed.swap(true, Ordering::Relaxed) {
+        DROPPERS.lock().unwrap_or_else(|e| e.into_inner()).push(p.clone());
+    }
+}
+
+/// A program's name as its container carries it (`..._Wrapped`), if any.
+#[cfg(feature = "diagnostics")]
+fn program_name(container: &[u8]) -> Option<String> {
+    const END: &[u8] = b"_Wrapped";
+    let at = container.windows(END.len()).position(|w| w == END)?;
+    let start = container[..at]
+        .iter()
+        .rposition(|&b| !(b.is_ascii_alphanumeric() || b == b'_' || b == b':'))
+        .map_or(0, |i| i + 1);
+    (at - start >= 4).then(|| String::from_utf8_lossy(&container[start..at]).into_owned())
+}
+
+/// What `p` is made of, for the report: stage, hash and name if known.
+#[cfg(feature = "diagnostics")]
+fn describe(p: &Pending) -> String {
+    let parts: Vec<String> = p
+        .shaders
+        .iter()
+        .map(|s| match program_name(&s.container) {
+            Some(name) => format!("{} {} {name}", s.stage, s.hash),
+            None => format!("{} {}", s.stage, s.hash),
+        })
+        .collect();
+    parts.join(" + ")
+}
+
+/// Where `p` stands, for the report.
+#[cfg(feature = "diagnostics")]
+fn state(p: &Pending) -> String {
+    if let Some(why) = p.left_out {
+        return format!("left out by name ({why})");
+    }
+    match p.made.get() {
+        Some(Some(_)) => "made".into(),
+        Some(None) => format!("failed: {}", missing(p).unwrap_or_default()),
+        None => match p.queue_state.load(Ordering::Relaxed) {
+            NOT_QUEUED => "never queued".into(),
+            EARLY => "queued early (no draw asked yet)".into(),
+            REQUESTED => "queued, asked for by a draw".into(),
+            _ => "compiling".into(),
+        },
+    }
+}
+
+/// (Fox P, diagnostics) The line on pipelines not there, for the frame
+/// lines (every few seconds, over `frames` frames): pending ones, failed
+/// ones, made of late, the queue and the workers; the ten pipelines whose
+/// draws and dispatches were dropped most; and the programs left out by name.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn report(frames: f64) {
+    let frames = frames.max(1.0);
+    let now = Instant::now();
+    let age = |p: &Pending| p.queued_at.get().map_or(0.0, |t| now.duration_since(*t).as_secs_f64());
+    let (pending, requested, oldest, lengths) = {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.all.retain(|p| p.made.get().is_none());
+        let requested = queue.all.iter().filter(|p| p.queue_state.load(Ordering::Relaxed) >= REQUESTED).count();
+        let oldest = queue.all.iter().map(|p| age(p)).fold(0.0, f64::max);
+        let lengths = [queue.screen.len(), queue.requested.len(), queue.early.len(), queue.slow.len()];
+        (queue.all.len(), requested, oldest, lengths)
+    };
+    let mut top: Vec<(u64, Arc<Pending>)> = {
+        let mut droppers = DROPPERS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut top = Vec::new();
+        droppers.retain(|p| {
+            let n = p.drops.swap(0, Ordering::Relaxed);
+            if n > 0 {
+                top.push((n, p.clone()));
+            }
+            let keep = n > 0 || !matches!(p.made.get(), Some(Some(_)));
+            if !keep {
+                p.followed.store(false, Ordering::Relaxed);
+            }
+            keep
+        });
+        top
+    };
+    top.sort_by(|a, b| b.0.cmp(&a.0));
+    let distinct = top.len();
+    let total: u64 = top.iter().map(|t| t.0).sum();
+    let shown: Vec<String> = top
+        .iter()
+        .take(10)
+        .map(|(n, p)| {
+            let pending_for = if p.made.get().is_none() && p.left_out.is_none() {
+                format!(", pending for {:.0} s", age(p))
+            } else {
+                String::new()
+            };
+            format!("[{} x {:.1}/frame, {}{pending_for}]", describe(p), *n as f64 / frames, state(p))
+        })
+        .collect();
+    tracing::info!(
+        "pipelines pending: {pending} distinct ({requested} asked for by a draw; oldest {oldest:.0} s), failed since the start: {}, \
+         made in the last {:.1} frames: {}, queue: screen {} asked {} early {} slow {}, workers busy {} of {}; \
+         draws and dispatches dropped per frame for want of a host pipeline: {:.1} of {distinct} pipelines, the most: {}",
+        FAILED.load(Ordering::Relaxed),
+        frames,
+        MADE_RECENT.swap(0, Ordering::Relaxed),
+        lengths[0],
+        lengths[1],
+        lengths[2],
+        lengths[3],
+        BUSY.load(Ordering::Relaxed),
+        WORKERS.load(Ordering::Relaxed),
+        total as f64 / frames,
+        if shown.is_empty() { "none".to_owned() } else { shown.join(" ") }
+    );
+    let families: Vec<String> = FAMILIES
+        .iter()
+        .zip(&FAMILY_RUNS)
+        .map(|(name, runs)| {
+            let [a, b, c, d] = [0, 1, 2, 3].map(|i| runs[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            format!("{name}: dispatches run {a:.1} dropped {b:.1}, indirect run {c:.1} dropped {d:.1}")
+        })
+        .collect();
+    tracing::info!(
+        "programs left out by name, per frame: {} (VICTORY_RT_RESOLVE=1 / VICTORY_ACTIVATE_RAYS=1: made; both made with VICTORY_BVH_BUILDER=1 \
+         unless =0)",
+        families.join("; ")
+    );
+}
 
 /// The workers ran out of work: logged after a batch of 10 or more, and
 /// the cache saved (at most every 20 s).
@@ -639,6 +885,34 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// (Fox P) A pipeline left out by name is told as such, never as
+    /// "being made"; one never queued names the variant.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn left_out_pipelines_are_not_being_made() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.left_out = Some("test");
+        p.family = Some(0);
+        let p = Arc::new(p);
+        assert!(ready(&p).is_none());
+        let why = missing(&p).unwrap();
+        assert!(why.starts_with("left out by name: CS_RaytracingResolve"), "{why}");
+        let q = Pending::new(Vec::new(), None);
+        assert!(missing(&q).unwrap().contains("variant"));
+        q.queue_state.store(MAKING, Ordering::Relaxed);
+        assert_eq!(missing(&q).unwrap(), "being made");
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn program_names_are_read_from_the_container() {
+        assert_eq!(
+            program_name(b"\0\x01billboard_nobump:CS_RaytracingResolve_a56bfb9c_Wrapped\0").as_deref(),
+            Some("billboard_nobump:CS_RaytracingResolve_a56bfb9c")
+        );
+        assert_eq!(program_name(b"nothing here"), None);
     }
 
     #[test]

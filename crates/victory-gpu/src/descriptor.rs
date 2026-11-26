@@ -1295,6 +1295,8 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
     if let Some([lo, hi, size, _]) = words(desc) {
         let address = u64::from(lo) | u64::from(hi) << 32;
+        #[cfg(windows)]
+        crate::loadmeter::view(address, u64::from(size), crate::loadmeter::ViewKind::Constant);
         record(handle, View::Constant(address, size));
     }
 }
@@ -1331,6 +1333,8 @@ pub(crate) extern "system" fn create_placed_srv(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+        #[cfg(windows)]
+        crate::loadmeter::placed_view(&resource, &desc);
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1342,6 +1346,8 @@ pub(crate) extern "system" fn create_placed_uav(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+        #[cfg(windows)]
+        crate::loadmeter::placed_view(&resource, &desc);
         record(handle, View::Placed(true, resource, desc));
     }
 }

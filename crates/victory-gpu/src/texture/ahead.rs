@@ -273,6 +273,9 @@ impl Worker {
                 job.record(&self.list);
             }
             self.list.Close()?;
+            // (Fox V, `VICTORY_PAGE_POOL`) Copies on pages have their tiles
+            // mapped on the host's queue: this queue waits for that first.
+            crate::pool::pages_ready(&self.queue);
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
             self.queue.Signal(&self.fence, value)?;
             // (Without an event: this waits.)

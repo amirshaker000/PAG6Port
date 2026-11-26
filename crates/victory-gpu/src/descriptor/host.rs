@@ -2877,6 +2877,25 @@ impl HostHeap {
     /// ([`ListViews`]). What is known of the record in this recording;
     /// `None` (the slot is not made): not a view kept so.
     pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+        self.make_listed_in(recording, words, index, None)
+    }
+
+    /// (Fox T, `VICTORY_LIST_BATCH=1`) As [`HostHeap::make_listed`], with the
+    /// descriptor copies put in `batch` (destination, source) for one
+    /// `CopyDescriptors` when the table is done ([`flush_copies`]), and the
+    /// view's resource kept by the list once (the second value, the first
+    /// time the recording uses the view: `HostList::keep`), not by the slot.
+    pub(crate) fn make_listed_batched(
+        &self,
+        recording: u64,
+        words: [u32; 3],
+        index: u32,
+        batch: &mut CopyBatch,
+    ) -> Option<Listed> {
+        self.make_listed_in(recording, words, index, Some(batch))
+    }
+
+    fn make_listed_in(&self, recording: u64, words: [u32; 3], index: u32, mut batch: Option<&mut CopyBatch>) -> Option<Listed> {
         if self.sampler {
             return None;
         }
@@ -2907,18 +2926,47 @@ impl HostHeap {
                     ready: (0, 0, false),
                     tabled: None,
                 };
-                views.made.insert(words, ListView { view, at, twin, stride_word, kept, listed });
+                views.made.insert(words, ListView { view, at, twin, stride_word, kept, listed, list_kept: false });
             }
-            let made = &views.made[&words];
-            self.copy_from(index, views.slot(made.at));
-            if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
-                self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                self.clear_twin(index);
+            let at = views.made.get(&words)?.at;
+            let (slot0, slot1) = (views.slot(at), views.slot(at + 1));
+            let made = views.made.get_mut(&words)?;
+            match batch.as_deref_mut() {
+                None => {
+                    self.copy_from(index, slot0);
+                    if made.twin && twins {
+                        self.copy_from(self.raw + index, slot1);
+                        self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        self.clear_twin(index);
+                    }
+                    self.write_stride(index, made.stride_word);
+                    self.keep(index, made.kept.clone());
+                }
+                Some(batch) => {
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(written) = self.written.get(index as usize) {
+                        written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    batch.copies.push((self.cpu(index), slot0));
+                    if made.twin && twins {
+                        batch.copies.push((self.cpu(self.raw + index), slot1));
+                        self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        self.clear_twin(index);
+                    }
+                    self.write_stride(index, made.stride_word);
+                    // The list holds the view's resource from its first use in
+                    // this recording until it is reset: the slot, owned by
+                    // the list until then, needs no hold of its own.
+                    if !made.list_kept {
+                        made.list_kept = true;
+                        if let Some(kept) = &made.kept {
+                            batch.keep.push(kept.clone());
+                        }
+                    }
+                }
             }
-            self.write_stride(index, made.stride_word);
-            self.keep(index, made.kept.clone());
             Some(made.listed)
         })
     }
@@ -5942,6 +5990,69 @@ struct ListView {
     stride_word: u32,
     kept: Kept,
     listed: Listed,
+    /// (Fox T, `VICTORY_LIST_BATCH`) The list of this recording holds `kept`.
+    list_kept: bool,
+}
+
+/// (Fox T, `VICTORY_LIST_BATCH=1`, default off) The descriptor copies of a new
+/// table's slots made from views made before in the list
+/// ([`HostHeap::make_listed_batched`]): done by one `CopyDescriptors` per
+/// table ([`flush_copies`]), the same copies; and the resources the list is
+/// to hold.
+#[derive(Default)]
+pub(crate) struct CopyBatch {
+    copies: Vec<(D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE)>,
+    pub(crate) keep: Vec<ID3D12Resource>,
+}
+
+/// `VICTORY_LIST_BATCH=1`.
+pub(crate) fn list_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_BATCH").is_some_and(|v| v == "1"))
+}
+
+/// (`VICTORY_LIST_BATCH`) Slots copied through a batch, and the batches.
+pub(crate) static LIST_BATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static LIST_FLUSHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The copies of `batch`, in one call: destinations that follow each other
+/// as one range, sources one descriptor each.
+pub(crate) fn flush_copies(batch: &mut CopyBatch) {
+    if batch.copies.is_empty() {
+        return;
+    }
+    let Some(host) = host() else { return };
+    static STEP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    // SAFETY: a plain query.
+    let step = *STEP.get_or_init(|| unsafe { host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) } as usize);
+    let mut dest_starts = Vec::with_capacity(batch.copies.len());
+    let mut dest_sizes: Vec<u32> = Vec::with_capacity(batch.copies.len());
+    for &(dst, _) in &batch.copies {
+        match (dest_starts.last(), dest_sizes.last_mut()) {
+            (Some(&D3D12_CPU_DESCRIPTOR_HANDLE { ptr }), Some(size)) if ptr + *size as usize * step == dst.ptr => *size += 1,
+            _ => {
+                dest_starts.push(dst);
+                dest_sizes.push(1);
+            }
+        }
+    }
+    let src_starts: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = batch.copies.iter().map(|c| c.1).collect();
+    let ones = vec![1u32; src_starts.len()];
+    // SAFETY: slots of our heap and of this thread's, as `copy_from` takes them.
+    unsafe {
+        host.device.CopyDescriptors(
+            dest_starts.len() as u32,
+            dest_starts.as_ptr(),
+            Some(dest_sizes.as_ptr()),
+            src_starts.len() as u32,
+            src_starts.as_ptr(),
+            Some(ones.as_ptr()),
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        )
+    };
+    LIST_FLUSHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    LIST_BATCHED.fetch_add(batch.copies.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    batch.copies.clear();
 }
 
 /// The descriptors a thread made for one recording of a list, by the record

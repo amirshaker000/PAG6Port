@@ -29,6 +29,10 @@ use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, p
 use crate::bvh;
 use crate::resource::BvhNodes;
 
+/// (Fox T) Ray-tracing node tests translated with the second half of a 128-byte box
+/// node read through the first half's directory entry (`VICTORY_BVH_PAGE_REUSE=1`).
+pub static PAGES_REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(test)]
 thread_local! {
     /// The tests' stand-in for title memory ([`Lower::bvh_memory`]): a
@@ -48,7 +52,8 @@ enum NodeAt {
     /// first 64 bytes and the node's byte in it ([`Lower::bvh_memory`]),
     /// the node's address, for the second half of a 128-byte node, and
     /// whether there is a copy.
-    Memory { handle: V, byte: V, low: V, high: V, mapped: V },
+    /// (Fox T) `slot`: the heap slot of the view, for [`super::bvh_page_reuse`].
+    Memory { handle: V, byte: V, low: V, high: V, mapped: V, slot: V },
 }
 
 /// The ray operands, as floats.
@@ -164,13 +169,14 @@ impl<'a> Lower<'a> {
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
-                let (handle, byte, mapped) = self.bvh_memory(low, high, guard);
+                let (handle, byte, mapped, slot) = self.bvh_memory(low, high, guard);
                 NodeAt::Memory {
                     handle,
                     byte,
                     low,
                     high,
                     mapped,
+                    slot,
                 }
             }
         };
@@ -182,6 +188,9 @@ impl<'a> Lower<'a> {
         let pair = self.s.m.bin(head, Bin::And, pointer, k6);
         let is_box = self.s.m.cmp(head, pred::EQ, pair, k4);
         let is_triangle = self.s.m.cmp(head, pred::IULT, kind, k4);
+        if crate::emit::bvh_walk() && self.s.threads.is_some() {
+            self.bvh_walk_count(is_box, is_triangle);
+        }
         let (box_block, leaf_block) = (self.s.m.new_block(), self.s.m.new_block());
         let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
         self.s
@@ -223,11 +232,33 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// (Fox T, `VICTORY_BVH_WALK=1`) This thread's node test counted in its dword of the
+    /// [`crate::emit::SLOT_WALK`] buffer: 1 for a box node, 0x10000 for a triangle.
+    fn bvh_walk_count(&mut self, is_box: V, is_triangle: V) {
+        let c = self.cur;
+        let (entry, i32t) = (self.s.entry, self.s.t.i32);
+        let (k0, k1) = (self.s.m.i32(0), self.s.m.i32(1));
+        let x = self.s.op(entry, "threadId.i32", Attr::ReadNone, i32t, 93, &[k0]);
+        let y = self.s.op(entry, "threadId.i32", Attr::ReadNone, i32t, 93, &[k1]);
+        let (k12, k2) = (self.s.m.i32(12), self.s.m.i32(2));
+        let mask = self.s.m.i32(crate::emit::WALK_SLOTS - 1);
+        let row = self.s.m.bin(c, Bin::Shl, y, k12);
+        let at = self.s.m.bin(c, Bin::Add, x, row);
+        let at = self.s.m.bin(c, Bin::And, at, mask);
+        let byte = self.s.m.bin(c, Bin::Shl, at, k2);
+        let (one, high) = (self.s.m.i32(1), self.s.m.i32(0x10000));
+        let leaf = self.s.m.select(c, is_triangle, high, k0);
+        let add = self.s.m.select(c, is_box, one, leaf);
+        let h = self.s.root_uav_handle(crate::emit::SLOT_WALK);
+        let iu = self.s.m.undef(i32t);
+        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, k0, byte, iu, iu, add]);
+    }
+
     /// Title memory at `low`/`high` for a node's bytes: the raw view of the
     /// host copy holding the address and the byte in that view
     /// ([`Lower::memory`]: a page the host has no copy of reads zeros and
     /// is left for the host to fetch, for lanes that run).
-    fn bvh_memory(&mut self, low: V, high: V, guard: Option<V>) -> (V, V, V) {
+    fn bvh_memory(&mut self, low: V, high: V, guard: Option<V>) -> (V, V, V, V) {
         #[cfg(test)]
         if let Some((slot, base)) = TEST_MEMORY.get() {
             // The buffer at heap slot `slot` holds the bytes from title
@@ -244,11 +275,35 @@ impl<'a> Lower<'a> {
             let inside = self.s.m.bin(c, Bin::And, in_low, in_high);
             let outside = self.s.m.i32(0xffff_ff00);
             let at = self.s.m.select(c, inside, at, outside);
-            return (handle, at, inside);
+            return (handle, at, inside, slot);
         }
-        let (handle, byte) = self.memory(low, high, guard, false);
+        let (handle, slot, byte) = self.memory_parts(low, high, guard, false, true);
         let mapped = self.page_there.expect("memory says");
-        (handle, byte, mapped)
+        (handle.expect("asked for"), byte, mapped, slot)
+    }
+
+    /// (Fox T) [`Lower::bvh_memory`] without the view, for lanes that all run: the
+    /// (unused) view, the slot, the byte and whether the page is there.
+    fn bvh_memory_slot(&mut self, low: V, high: V) -> (Option<V>, V, V, V) {
+        #[cfg(test)]
+        if TEST_MEMORY.get().is_some() {
+            let (handle, byte, mapped, slot) = self.bvh_memory(low, high, None);
+            return (Some(handle), slot, byte, mapped);
+        }
+        let (_, slot, byte) = self.memory_parts(low, high, None, false, false);
+        let mapped = self.page_there.expect("memory says");
+        (None, slot, byte, mapped)
+    }
+
+    /// (Fox T) The view of title memory at heap slot `slot`, as [`Lower::bvh_memory`]
+    /// makes it.
+    fn bvh_view(&mut self, slot: V) -> V {
+        #[cfg(test)]
+        if TEST_MEMORY.get().is_some() {
+            let c = self.cur;
+            return self.s.heap_handle(c, slot, false, false, (11, 0));
+        }
+        self.memory_handle(slot)
     }
 
     /// The second 64 bytes of a 128-byte node: in a page, and in a copy, of
@@ -260,16 +315,43 @@ impl<'a> Lower<'a> {
                 let byte = self.s.m.bin(self.cur, Bin::Add, byte, size);
                 NodeAt::Buffer { handle, byte }
             }
-            NodeAt::Memory { low, high, .. } => {
+            NodeAt::Memory { low, high, .. } if !crate::emit::bvh_page_reuse() => {
                 let (low, high) = self.address_plus(low, high, 64);
                 // Every lane in this block runs the instruction.
-                let (handle, byte, mapped) = self.bvh_memory(low, high, None);
+                let (handle, byte, mapped, slot) = self.bvh_memory(low, high, None);
                 NodeAt::Memory {
                     handle,
                     byte,
                     low,
                     high,
                     mapped,
+                    slot,
+                }
+            }
+            NodeAt::Memory { byte: first, low: first_low, high: first_high, mapped: first_mapped, slot: first_slot, .. } => {
+                // (Fox T, `VICTORY_BVH_PAGE_REUSE`) The second half in the first one's
+                // page: its directory entry is the first half's; only a node that
+                // crosses into the next page looks that page up.
+                let c = self.cur;
+                let (k64k, last) = (self.s.m.i32(0xFFFF), self.s.m.i32(0xFFFF - 64));
+                let within = self.s.m.bin(c, Bin::And, first_low, k64k);
+                let crosses = self.s.m.cmp(c, pred::IUGT, within, last);
+                let (low, high) = self.address_plus(first_low, first_high, 64);
+                let k64 = self.s.m.i32(64);
+                let same_byte = self.s.m.bin(c, Bin::Add, first, k64);
+                let gate = self.begin_guarded(Some(crosses));
+                let (_, slot, byte, mapped) = self.bvh_memory_slot(low, high);
+                let joined = self.end_guarded(gate, &[(slot, first_slot), (byte, same_byte), (mapped, first_mapped)]);
+                let (slot, byte, mapped) = (joined[0], joined[1], joined[2]);
+                let handle = self.bvh_view(slot);
+                PAGES_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                NodeAt::Memory {
+                    handle,
+                    byte,
+                    low,
+                    high,
+                    mapped,
+                    slot,
                 }
             }
         }

@@ -127,11 +127,39 @@ pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bo
     })
 }
 
+/// (Coder W, diagnostics) [`read_by`]'s first match: what reads a placed copy's destination
+/// on the CPU, and where.
+#[cfg(feature = "diagnostics")]
+pub(super) fn read_by_who(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> Option<(&'static str, usize, usize)> {
+    join_ranges(&mut ranges, []);
+    for list in runs {
+        for step in list.deferred().copies.iter() {
+            let hit = match step {
+                &Step::Copy(_, src, len) => touches(&ranges, src, src + len).then_some(("a placed copy's destination, read by a buffer copy", src, len)),
+                &Step::Fill(_, src, len, _) => touches(&ranges, src, src + len).then_some(("a placed copy's destination, read by a fill", src, len)),
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    touches(&ranges, at, at + len).then_some(("a placed copy's destination, read by a texture", at, len))
+                }
+                &Step::Plane((at, len), _) => touches(&ranges, at, at.saturating_add(len)).then_some(("a placed copy's destination, read by a plane", at, len)),
+                Step::Host(_, (from, to)) => touches(&ranges, *from, *to).then_some(("a placed copy's destination, read by a host step", *from, to - from)),
+                Step::Placed(p) => (p.from.is_some() && touches(&ranges, p.src, p.src + p.len))
+                    .then_some(("a placed copy's destination, the source of a placed copy from the CPU", p.src, p.len)),
+                _ => None,
+            };
+            if hit.is_some() {
+                return hit;
+            }
+        }
+    }
+    None
+}
+
 /// Everything recorded so far is done, and seen, before what follows.
 ///
 /// # Safety
 /// An open list.
-unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
+pub(super) unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
     static ENHANCED: OnceLock<bool> = OnceLock::new();
     let enhanced = *ENHANCED.get_or_init(|| {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
@@ -318,5 +346,119 @@ mod tests {
             after.saturating_sub(before)
         );
         drop((card, pc));
+    }
+}
+
+/// (Coder W) `VICTORY_FILL_FROM_PLACED`: 0 off, 1 on, 2 verify.
+///
+/// A fill of upload memory that reads the destination of a copy at its place earlier in the
+/// submission waited for every flight that may write that destination or the copy's source
+/// ([`Waits::ForReaders`], `blocked_by`): run-192 had 3-6 ms a frame of such waits, all fills
+/// of a few hundred bytes behind copies of the same size. Where the copy takes its source on
+/// the CPU (`from`: no flight writes the source), the bytes the destination holds right after
+/// the copy are the source's as the copy reads them at submission, whatever the flights put
+/// there before. So a fill that reads only bytes that copy wrote, with no step between them
+/// writing those bytes or the copy's source (a buffer copy, another copy at its place, a step
+/// of ours ends the look), reads the copy's source instead: the same bytes, no wait. With
+/// `verify` the fills are left as they are (the wait stands) and, once they are done, the
+/// bytes they read are compared with what the other source holds: differing bytes are
+/// counted (must be 0).
+pub(super) fn fill_from_placed() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_FILL_FROM_PLACED").as_deref().map(str::trim) {
+        Ok("1") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+/// [`fill_from_placed`]'s counters since the start: fills redirected (or found redirectable),
+/// their bytes, fills compared, bytes that differed.
+static FROM_PLACED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+thread_local! {
+    /// (verify) The fills to compare once done: (what they read, the copy's source, bytes).
+    static TO_CHECK: std::cell::RefCell<Vec<(usize, usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Before the submission of `runs` is planned, with flights in the air writing `written`.
+pub(super) fn redirect_fills(runs: &[&HostList], written: &[(usize, usize)]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mode = fill_from_placed();
+    if mode == 0 || written.is_empty() {
+        return;
+    }
+    // Copies at their place seen so far whose bytes are known at submission: (dst, src, len).
+    let mut known: Vec<(usize, usize, usize)> = Vec::new();
+    let meets = |a: usize, b: usize, c: usize, d: usize| a < d && c < b;
+    for list in runs {
+        let mut deferred = list.deferred();
+        for step in deferred.copies.iter_mut() {
+            // What title memory this step writes, if any.
+            let wrote = match step {
+                Step::Run(_) => {
+                    known.clear();
+                    continue;
+                }
+                &mut Step::Copy(dst, _, len) => Some((dst, len)),
+                Step::Placed(p) => {
+                    let w = (p.dst, p.len);
+                    // (A newer one over the same bytes stands from here.)
+                    known.retain(|&(d, s, l)| !meets(d, d + l, w.0, w.0 + w.1) && !meets(s, s + l, w.0, w.0 + w.1));
+                    if p.from.is_some() && !matches!(p.waits(written), Waits::Yes) {
+                        known.push((p.dst, p.src, p.len));
+                    }
+                    continue;
+                }
+                Step::Fill(_, src, len, _) => {
+                    let (at, n) = (*src, *len);
+                    if let Some(&(d, s, _)) = known.iter().rev().find(|&&(d, _, l)| d <= at && at + n <= d + l) {
+                        let from = s + (at - d);
+                        FROM_PLACED[0].fetch_add(1, Relaxed);
+                        FROM_PLACED[1].fetch_add(n as u64, Relaxed);
+                        if mode == 1 {
+                            *src = from;
+                        } else {
+                            TO_CHECK.with_borrow_mut(|c| c.push((at, from, n)));
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            };
+            if let Some((w, n)) = wrote {
+                known.retain(|&(d, s, l)| !meets(d, d + l, w, w + n) && !meets(s, s + l, w, w + n));
+            }
+        }
+    }
+}
+
+/// (verify) After the submission's fills are done: what they read against the copies' sources.
+pub(super) fn check_fills() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let checks = TO_CHECK.with_borrow_mut(std::mem::take);
+    for (read, other, n) in checks {
+        let (mut a, mut b) = (vec![0u8; n], vec![0u8; n]);
+        let _ = (read_into(read as *const u8, &mut a), read_into(other as *const u8, &mut b));
+        FROM_PLACED[2].fetch_add(1, Relaxed);
+        let differ = a.iter().zip(&b).filter(|(x, y)| x != y).count() as u64;
+        if differ > 0 {
+            FROM_PLACED[3].fetch_add(differ, Relaxed);
+            tracing::warn!(at = format_args!("{read:#x}"), other = format_args!("{other:#x}"), n, differ, "fill from a placed copy's source: bytes differ");
+        }
+    }
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_none_or(|t| t.elapsed().as_secs() >= 5) {
+        *last = Some(std::time::Instant::now());
+        tracing::info!(
+            "fills from a placed copy's source (VICTORY_FILL_FROM_PLACED={}), since the start: {} fills {} bytes {}; compared {}; MUST BE 0: bytes that differ {}",
+            ["0", "1", "verify"][fill_from_placed() as usize],
+            FROM_PLACED[0].load(Relaxed),
+            FROM_PLACED[1].load(Relaxed),
+            if fill_from_placed() == 1 { "read from the source instead (no wait)" } else { "would be" },
+            FROM_PLACED[2].load(Relaxed),
+            FROM_PLACED[3].load(Relaxed),
+        );
     }
 }

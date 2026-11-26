@@ -129,7 +129,7 @@ pub use lower::{D16_BITS_ACCESSES, D16_VIEW_KIND_ACCESSES, HALVES_PLACES, d16_vi
 pub use PAIRED_BEFORE_WIDE as WAVE_PAIRED_BEFORE_WIDE;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_WALK, WALK_SLOTS,
     SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
@@ -198,6 +198,37 @@ pub fn group_sync() -> u8 {
 pub fn builder_fences() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FENCES").is_none_or(|v| v != "0"))
+}
+
+/// (Fox T, a meter) `VICTORY_BVH_WALK=1`: each ray-tracing node test of a compute program
+/// also counts itself in its thread's dword of the [`SLOT_WALK`] buffer (box and triangle
+/// tests apart), so that the host can tell how many nodes each ray visits. Adds one atomic
+/// per test to a buffer of ours; what the program computes is unchanged. Part of the
+/// translation: the shader cache keys on it.
+pub fn bvh_walk() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_WALK").is_some_and(|v| v == "1"))
+}
+
+/// (Fox T) `VICTORY_BVH_PAGE_REUSE=1`: the second 64 bytes of a 128-byte box node of a
+/// ray-tracing node test (`image_bvh_intersect_ray`, `intersect.rs`) are read through the
+/// directory entry of the first 64 bytes when both lie in the same 64 KiB page of title
+/// memory (the entry is the page's: the same copy, the byte 64 on), and looked up anew
+/// only where the node crosses a page. Exact: the same bytes are read. Off: two lookups
+/// per such node, as before. Part of the translation: the shader cache keys on it.
+pub fn bvh_page_reuse() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_BVH_PAGE_REUSE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_PAGE_REUSE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`bvh_page_reuse`], for its thread only.
+    pub(crate) static TEST_BVH_PAGE_REUSE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether the structure builder's accesses through its root views stay near

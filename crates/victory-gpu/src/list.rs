@@ -149,15 +149,24 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
+#[track_caller]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
-    let Some(list) = host_list(this) else { return };
+    // (Coder W, diagnostics) By the list call that asked.
     #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
+    let at = std::panic::Location::caller();
+    let Some(list) = host_list(this) else { return };
+    // (Coder W) Timed only with `VICTORY_LIST_CALLS=1`: in the diagnostics build the user
+    // plays, a list call reads no clock and touches no shared counter otherwise.
+    #[cfg(feature = "diagnostics")]
+    let started = crate::copystep::list_meter().then(std::time::Instant::now);
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(feature = "diagnostics")]
-    crate::copystat::recorded(started);
+    if let Some(started) = started {
+        crate::copystep::list_call(at, started.elapsed().as_nanos() as u64);
+        crate::copystat::recorded(started);
+    }
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'
@@ -179,6 +188,35 @@ pub(crate) fn tables_done(lists: &[This]) {
 
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
+/// (Fox T, `VICTORY_PASS_TIMES`) A title list method that is not a draw or a
+/// dispatch, timed as a pass of its own (copies, barriers, clears, resolves,
+/// syncs, waits, writes): its stamp before at the start, after when dropped.
+#[cfg(feature = "diagnostics")]
+struct TitleOp(This);
+
+#[cfg(feature = "diagnostics")]
+impl TitleOp {
+    fn begin(this: This, kind: crate::host::passtimes::Kind, name: &'static str) -> Self {
+        if crate::host::passtimes::on()
+            && let Some(list) = host_list(this)
+        {
+            list.pass_begin(kind, || std::sync::Arc::from(name));
+        }
+        TitleOp(this)
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for TitleOp {
+    fn drop(&mut self) {
+        if crate::host::passtimes::on()
+            && let Some(list) = host_list(self.0)
+        {
+            list.pass_end();
+        }
+    }
+}
+
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
@@ -827,6 +865,8 @@ const UAV_BARRIER: Barrier = Barrier {
 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleBarrier, "barrier");
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
@@ -920,6 +960,8 @@ extern "system" fn copy_buffer_region(
     src_offset: u64,
     len: u64,
 ) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleCopy, "copy_buffer_region");
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
@@ -952,6 +994,8 @@ fn unlike(dst: This, src: This) -> bool {
 pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleCopy, "copy_resource");
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -1017,6 +1061,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleCopy, "copy_resource_x");
     copy_resource(this, dst, src);
 }
 
@@ -1042,6 +1088,8 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleCopy, "copy_texture_region");
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1314,6 +1362,8 @@ extern "system" fn copy_texture_region_x(
     source_box: *const [u32; 6],
     _flags: u32,
 ) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleCopy, "copy_texture_region_x");
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
@@ -1325,6 +1375,8 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleResolve, "resolve");
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
@@ -1401,6 +1453,8 @@ extern "system" fn clear_rtv(
     count: u32,
     rects: *const Rect,
 ) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleClear, "clear_rtv");
     #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
@@ -1451,6 +1505,8 @@ extern "system" fn clear_dsv(
     count: u32,
     rects: *const Rect,
 ) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleClear, "clear_dsv");
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
@@ -1490,6 +1546,8 @@ extern "system" fn clear_dsv(
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleCopy, "copy_memory");
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
@@ -1549,6 +1607,8 @@ extern "system" fn resolve_queries(
     buffer: This,
     offset: u64,
 ) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleQuery, "resolve_queries");
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
@@ -1607,6 +1667,8 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// (Arguments may be what earlier shaders wrote from here on:
 /// `State::synced`.)
 extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleSync, "sync");
     #[cfg(windows)]
     {
         with_state(this, |_, state| state.synced());
@@ -2177,9 +2239,13 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
         .push((this as usize, wait));
 }
 extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleWait, "wait_value");
     wait_for(this, address, comparison, reference, false);
 }
 extern "system" fn wait_value64(this: This, address: u64, comparison: u32, reference: u64) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleWait, "wait_value64");
     wait_for(this, address, comparison, reference, true);
 }
 
@@ -2189,6 +2255,8 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleBarrier, "barrier_groups");
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2216,10 +2284,14 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 /// 64 bits: done when the list has run, as the GPU would. Flag 1 writes the
 /// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleWrite, "write32");
     defer_write(this, address, Written::Value(u64::from(value)), 4);
     value_written(this, address, u64::from(value));
 }
 extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = TitleOp::begin(this, crate::host::passtimes::Kind::TitleWrite, "write64");
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {

@@ -93,6 +93,12 @@ pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
 /// (shared will do: what notes an answer holds it alone).
 static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// (Coder H, F23 meter; coder K, `VICTORY_GPU_ONLY`) The number of the last
+/// asking so far (no new one). (Merge foxM: both trees added it, one kept.)
+pub(crate) fn asking_now() -> u64 {
+    ASKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn next_asking() -> u64 {
     ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
@@ -213,10 +219,28 @@ fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
 }
 
 fn journal_mut() -> std::sync::RwLockWriteGuard<'static, Journal> {
-    if let Ok(j) = JOURNAL.try_write() {
-        return j;
-    }
-    waited(2, || JOURNAL.write().unwrap_or_else(|e| e.into_inner()))
+    let j = match JOURNAL.try_write() {
+        Ok(j) => j,
+        Err(_) => waited(2, || JOURNAL.write().unwrap_or_else(|e| e.into_inner())),
+    };
+    // (Coder W) Whatever is changed under it, a stamp taken before is no more.
+    bump_write_gen();
+    j
+}
+
+/// (Coder W, `VICTORY_CLEAN_STAMP`) Counts every change of what [`nothing_new`] reads: the
+/// journal (each time it is held to change it), a block's published bit cleared, a block
+/// marked written beside its guard. An answer of [`nothing_new`] found with the count at
+/// `g` still holds while the count is `g` (it only reads those, and the copy's own notes,
+/// which only grow more current).
+static WRITE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn write_gen() -> u64 {
+    WRITE_GEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn bump_write_gen() {
+    WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Since the last line: waits and nanoseconds of waiting, of all threads, for
@@ -230,8 +254,11 @@ fn waited<T>(what: usize, f: impl FnOnce() -> T) -> T {
     use std::sync::atomic::Ordering::Relaxed;
     let began = std::time::Instant::now();
     let got = f();
+    let ns = began.elapsed().as_nanos() as u64;
     WAITS[what][0].fetch_add(1, Relaxed);
-    WAITS[what][1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+    WAITS[what][1].fetch_add(ns, Relaxed);
+    // (Coder W) And by thread: which threads the trackers' locks hold up.
+    crate::copystep::thread_ns(if what == 3 { crate::copystep::T_GUARDS } else { crate::copystep::T_OTHER_LOCKS }, ns);
     got
 }
 
@@ -548,6 +575,11 @@ fn ask_early(every: std::time::Duration) {
 }
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
+/// (Coder W) Whether the submission's one asking stands ([`ask_once`]).
+pub(crate) fn once_kept() -> bool {
+    journal().kept
+}
+
 pub(crate) fn ask_ahead_done() {
     let mut j = journal_mut();
     if !j.kept {
@@ -646,6 +678,8 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    crate::pagekinds::ours(crate::pagekinds::Ours::ListCopy, at, len);
+    crate::lockmeter::note(crate::lockmeter::Source::ListCopy, at, len);
     let mut j = journal_mut();
     if !j.kept || len == 0 {
         return;
@@ -715,6 +749,18 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
+    // (coder K, `VICTORY_GPU_ONLY=1`) Pages the title keeps GPU-only (F24): nothing but our own known writes
+    // changes them, and those are in the journal (`crate::pagekinds::known`). No kernel, no guard.
+    // (Merge foxM) With `VICTORY_KNOWN_WRITES=1` a buffer copy's refresh reaches here only for the pages
+    // its filter did not spare (`Shadow::update_free`: KNOWN_WRITES first, then this rule, then tracking).
+    if crate::pagekinds::gpu_only_mode() == 1 {
+        if crate::pagekinds::exempt_asked(start, end, guarded) {
+            let j = journal();
+            return Some((next_asking(), of(&j)));
+        }
+        crate::pagekinds::returned(first, last);
+    }
+    let _kinds = crate::pagekinds::Timed::new(crate::pagekinds::Work::WriteWatchAsk, start, end.saturating_sub(start));
     // Asked ahead with the submission's other ranges: the journal has it.
     let ahead = |j: &Journal| j.ahead.holds(first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
@@ -768,6 +814,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         let j = journal();
         return Some((next_asking(), of(&j)));
     }
+    crate::pagekinds::found_written(pages.iter().map(|p| p.0));
     let answer = {
         let mut j = journal_mut();
         let now = next_asking();
@@ -783,6 +830,39 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         publish(&pages.iter().map(|p| p.0).collect::<Vec<_>>());
     }
     Some(answer)
+}
+
+/// (coder K, `VICTORY_GPU_ONLY=1`) A known write of ours (or a mapping change, a new texture level) on
+/// these 64 KiB pages: noted in the journal as an asking that found them written whole, so every copy that
+/// took them before takes them again. As [`wrote`]: under a submission's one asking the answers stand
+/// under this number.
+pub(crate) fn note_known(pages: &[usize]) {
+    if pages.is_empty() {
+        return;
+    }
+    let mut j = journal_mut();
+    let now = next_asking();
+    if j.kept {
+        j.ahead_asked = now;
+    }
+    for &page in pages {
+        j.note(page, WHOLE, now);
+    }
+    drop(j);
+    // (Merge foxM, G+J) With `VICTORY_KNOWN_WRITES` on too, the known-writes
+    // ledger is told of the same blocks (after the asking above, so the mark is
+    // >= every take before it): a page the journal now calls written is never
+    // spared by that filter, and its verify does not count this note as a
+    // "write the filter missed" (demotion). Nothing when `VICTORY_KNOWN_WRITES`
+    // is off (`knownwrites::note` returns at once).
+    for &page in pages {
+        crate::knownwrites::note(crate::knownwrites::SRC_OUR_COPY, page * PAGE, PAGE);
+    }
+}
+
+/// (coder K) The newest journal note on the 64 KiB pages `[first, last)` (0: none).
+pub(crate) fn last_noted(first: usize, last: usize) -> u64 {
+    journal().written.range(first..last).map(|(_, &w)| w).max().unwrap_or(0)
 }
 
 /// Whether nothing of `[start, end)` was written that a copy with the notes
@@ -882,7 +962,7 @@ pub(crate) fn light() -> bool {
 
 /// A bit per block of the address space, in pieces made when first needed
 /// and never let go.
-struct Bits([std::sync::atomic::AtomicPtr<BitsPiece>; Bits::PIECES]);
+pub(crate) struct Bits([std::sync::atomic::AtomicPtr<BitsPiece>; Bits::PIECES]);
 
 /// The bits of 4 GiB.
 type BitsPiece = [std::sync::atomic::AtomicU64; Bits::WORDS];
@@ -892,7 +972,7 @@ impl Bits {
     /// 128 TiB, what a process has.
     const PIECES: usize = 1 << 15;
 
-    const fn new() -> Bits {
+    pub(crate) const fn new() -> Bits {
         Bits([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Bits::PIECES])
     }
 
@@ -902,7 +982,7 @@ impl Bits {
         unsafe { piece.as_ref() }
     }
 
-    fn set(&self, block: usize) {
+    pub(crate) fn set(&self, block: usize) {
         use std::sync::atomic::Ordering::{AcqRel, Acquire, SeqCst};
         let word = block / 64;
         let Some(place) = self.0.get(word / Bits::WORDS) else {
@@ -919,15 +999,19 @@ impl Bits {
         if let Some(piece) = self.piece(word) {
             piece[word % Bits::WORDS].fetch_or(1 << (block % 64), SeqCst);
         }
+        // (Coder W) Written beside its guard: no longer known clean.
+        if std::ptr::eq(self, &BESIDE) {
+            bump_write_gen();
+        }
     }
 
     /// Sixty-four of them.
-    fn word(&self, word: usize) -> u64 {
+    pub(crate) fn word(&self, word: usize) -> u64 {
         self.piece(word).map_or(0, |piece| piece[word % Bits::WORDS].load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Whether it was set, and is no more.
-    fn take(&self, block: usize) -> bool {
+    pub(crate) fn take(&self, block: usize) -> bool {
         self.any(block, block + 1) && {
             let (word, bit) = (block / 64, 1 << (block % 64));
             self.piece(word)
@@ -935,17 +1019,21 @@ impl Bits {
         }
     }
 
-    fn clear(&self, block: usize) {
+    pub(crate) fn clear(&self, block: usize) {
         let word = block / 64;
         if let Some(piece) = self.piece(word) {
             // Ahead of the protection's change, and seen by whoever the
             // writer tells of its write.
             piece[word % Bits::WORDS].fetch_and(!(1 << (block % 64)), std::sync::atomic::Ordering::SeqCst);
         }
+        // (Coder W) Not known by its bit any more.
+        if std::ptr::eq(self, &PUBLISHED) {
+            bump_write_gen();
+        }
     }
 
     /// Whether a bit of `[first, last)` is set.
-    fn any(&self, first: usize, last: usize) -> bool {
+    pub(crate) fn any(&self, first: usize, last: usize) -> bool {
         let mut block = first;
         while block < last {
             let word = block / 64;
@@ -965,8 +1053,27 @@ impl Bits {
         false
     }
 
+    /// (coder K) The blocks of `[first, last)` whose bits are set, in order.
+    pub(crate) fn set_in(&self, first: usize, last: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut word = first / 64;
+        while word * 64 < last {
+            if self.piece(word).is_none() {
+                word = (word / Bits::WORDS + 1) * Bits::WORDS;
+                continue;
+            }
+            let mut w = self.word(word) & in_word(word * 64, first, last);
+            while w != 0 {
+                out.push(word * 64 + w.trailing_zeros() as usize);
+                w &= w - 1;
+            }
+            word += 1;
+        }
+        out
+    }
+
     /// Whether the bits of all of `[first, last)` are set (not so of none).
-    fn all(&self, first: usize, last: usize) -> bool {
+    pub(crate) fn all(&self, first: usize, last: usize) -> bool {
         let mut block = first;
         while block < last {
             let word = block / 64;
@@ -1172,6 +1279,8 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    crate::pagekinds::ours(crate::pagekinds::Ours::Mapped, at, len);
+    crate::lockmeter::note(crate::lockmeter::Source::Mapped, at, len);
     if len == 0 || !known_holes() {
         return;
     }
@@ -1260,7 +1369,8 @@ pub(crate) fn asks() -> [u64; 13] {
 }
 
 /// The guards' lock, the wait for it counted.
-fn guards_timed() -> std::sync::MutexGuard<'static, Guards> {
+#[track_caller]
+fn guards_timed() -> GuardsHeld {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let g = guards();
@@ -1479,11 +1589,62 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    if let Ok(g) = GUARDS.try_lock() {
-        return g;
+/// (coder G) Runs `f` holding the guards' lock: no protection of theirs changes meanwhile.
+pub(crate) fn with_guards_locked<T>(f: impl FnOnce() -> T) -> T {
+    let _g = guards();
+    f()
+}
+
+#[track_caller]
+fn guards() -> GuardsHeld {
+    #[cfg(feature = "diagnostics")]
+    let at = std::panic::Location::caller();
+    let g = match GUARDS.try_lock() {
+        Ok(g) => g,
+        Err(_) => waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner())),
+    };
+    #[cfg(feature = "diagnostics")]
+    {
+        GuardsHeld { g, at, since: crate::copystep::held_meter().then(std::time::Instant::now) }
     }
-    waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner()))
+    #[cfg(not(feature = "diagnostics"))]
+    g
+}
+
+/// (Coder W, diagnostics) The guards' lock as held, timed from the take to the release, by
+/// the code that took it ([`crate::copystep::guards_held`]).
+#[cfg(feature = "diagnostics")]
+struct GuardsHeld {
+    g: std::sync::MutexGuard<'static, Guards>,
+    at: &'static std::panic::Location<'static>,
+    since: Option<std::time::Instant>,
+}
+
+#[cfg(not(feature = "diagnostics"))]
+type GuardsHeld = std::sync::MutexGuard<'static, Guards>;
+
+#[cfg(feature = "diagnostics")]
+impl std::ops::Deref for GuardsHeld {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        &self.g
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl std::ops::DerefMut for GuardsHeld {
+    fn deref_mut(&mut self) -> &mut Guards {
+        &mut self.g
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for GuardsHeld {
+    fn drop(&mut self) {
+        if let Some(since) = self.since {
+            crate::copystep::guards_held(self.at, since.elapsed().as_nanos() as u64);
+        }
+    }
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
@@ -1572,6 +1733,10 @@ impl std::hash::Hasher for PageHash {
 
 /// What shaders wrote is about to go into title memory at `[at, at + len)`.
 pub(crate) fn landing(at: usize, len: usize) {
+    crate::pagekinds::ours(crate::pagekinds::Ours::Landing, at, len);
+    // (Coder J) In flight until the caller's `knownwrites::landed` (the bytes are in).
+    crate::knownwrites::landing(at, len);
+    crate::lockmeter::note(crate::lockmeter::Source::Landing, at, len);
     {
         let frame = crate::frame::current();
         let (first, last) = (at / KERNEL_PAGE, (at + len.max(1) - 1) / KERNEL_PAGE);
@@ -1606,6 +1771,10 @@ pub(crate) fn landing(at: usize, len: usize) {
 /// Returns the note's number, and for each 64 KiB block noted the number of
 /// the block's last write before (0: none is known).
 pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, Vec<(usize, u64)>) {
+    for &(at, len) in spans {
+        crate::pagekinds::ours(crate::pagekinds::Ours::Landing, at, len);
+        crate::lockmeter::note(crate::lockmeter::Source::Landing, at, len);
+    }
     let mut before = Vec::with_capacity(spans.len());
     let noted;
     // The same pages at other addresses: copies of the memory there have not
@@ -1688,6 +1857,7 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    let _kinds = crate::pagekinds::Timed::new(crate::pagekinds::Work::GuardArm, start, end.saturating_sub(start));
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -2206,6 +2376,9 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    crate::pagekinds::ours(crate::pagekinds::Ours::OurCopy, at, len);
+    crate::pagekinds::known(crate::pagekinds::Known::Ours, at, len);
+    crate::lockmeter::note(crate::lockmeter::Source::OurCopy, at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -2233,6 +2406,10 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    crate::pagekinds::ours(crate::pagekinds::Ours::KernelRead, at, len);
+    // (coder G) A kernel write into a guard page fails: the load-read meter's go first.
+    crate::loadmeter::kernel_writing(at, len);
+    crate::lockmeter::note(crate::lockmeter::Source::KernelRead, at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let mut g = guards_timed();
@@ -2255,6 +2432,11 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
 
 impl Drop for KernelWrite {
     fn drop(&mut self) {
+        crate::pagekinds::ours(crate::pagekinds::Ours::KernelRead, self.0 * BLOCK, (self.1 - self.0) * BLOCK);
+        // (coder K) After the kernel's write: copies that read before it take the pages again.
+        crate::pagekinds::known(crate::pagekinds::Known::Ours, self.0 * BLOCK, (self.1 - self.0) * BLOCK);
+        // (Coder H, F23 meter) The kernel's bytes are there now.
+        crate::lockmeter::note(crate::lockmeter::Source::KernelRead, self.0 * BLOCK, (self.1 - self.0) * BLOCK);
         if self.0 == self.1 {
             return;
         }
@@ -2312,10 +2494,14 @@ pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 4] = [const { std::syn
 /// takes the guards' lock, then, alone, the lock of the ranges kept for
 /// the texture pass.
 pub fn title_memory_written(at: usize, len: usize, pages: bool) {
+    crate::pagekinds::ours(if pages { crate::pagekinds::Ours::KernelPages } else { crate::pagekinds::Ours::KernelRead }, at, len);
+    crate::lockmeter::note(if pages { crate::lockmeter::Source::KernelPages } else { crate::lockmeter::Source::KernelRead }, at, len);
     use std::sync::atomic::Ordering::Relaxed;
     if len == 0 {
         return;
     }
+    // (coder K, `VICTORY_GPU_ONLY=1`) The bytes are there: noted for the pages no tracking looks at.
+    crate::pagekinds::known(crate::pagekinds::Known::Ours, at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -2347,6 +2533,13 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
 /// again - and are, the pages noted written, which also has the next check
 /// guard the new view ([`cover`]).
 pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
+    // (Coder J, `VICTORY_KNOWN_WRITES`) A new writable view: every address
+    // showing these bytes may change through it - a mapping change for all.
+    if crate::knownwrites::on() {
+        for (at, n) in crate::inplace::views_of_section(section, offset, len) {
+            crate::knownwrites::note(crate::knownwrites::SRC_MAPPED, at, n);
+        }
+    }
     if !view_guard() {
         return;
     }
@@ -2376,6 +2569,12 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 pub fn title_memory_splitting(at: usize, len: usize) {
     let _notes = NotesTimed::new();
     let others: Vec<usize> = elsewhere(at, len).into_iter().flat_map(|(_, others)| others).collect();
+    // (Coder J, `VICTORY_KNOWN_WRITES`) The view and every other address of its
+    // pages are opened: a mapping change for all (run-146 spared two such pages).
+    crate::knownwrites::note(crate::knownwrites::SRC_MAPPED, at, len);
+    for &other in &others {
+        crate::knownwrites::note(crate::knownwrites::SRC_MAPPED, other, BLOCK);
+    }
     if others.is_empty() {
         return;
     }
@@ -2833,6 +3032,9 @@ pub(crate) mod fine {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::pagekinds::ours(crate::pagekinds::Ours::Mapped, at, len);
+    crate::pagekinds::known(crate::pagekinds::Known::Mapped, at, len);
+    crate::lockmeter::note(crate::lockmeter::Source::Mapped, at, len);
     let _notes = NotesTimed::new();
     let _timed = crate::framelog::Timed::new(crate::framelog::T::RemapNotesNs);
     crate::texback::remapped(at, len);
@@ -2845,6 +3047,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    crate::pagekinds::ours(crate::pagekinds::Ours::Mapped, at, len);
+    crate::pagekinds::known(crate::pagekinds::Known::Mapped, at, len);
+    crate::loadmeter::unmapping(at, len);
+    crate::lockmeter::note(crate::lockmeter::Source::Mapped, at, len);
     let _notes = NotesTimed::new();
     let _timed = crate::framelog::Timed::new(crate::framelog::T::RemapNotesNs);
     crate::texback::remapped(at, len);
@@ -2871,6 +3077,13 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    // (Coder J, `VICTORY_KNOWN_WRITES`) What it showed goes: a mapping change
+    // (run-152's seven changed-or-uncompared misses: pages of streaming GPU-view
+    // windows found written by a guard opened here, unreadable, no mark since the take).
+    if crate::knownwrites::on() || crate::lockmeter::on() {
+        let n = if len != 0 { len } else { allocation_end(at, at).saturating_sub(at) };
+        crate::lockmeter::note(crate::lockmeter::Source::Mapped, at, n);
+    }
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
@@ -2923,7 +3136,8 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
-fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+#[track_caller]
+fn title_memory_changed(at: usize, len: usize) -> GuardsHeld {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -2951,6 +3165,59 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     g
 }
 
+/// (Coder H, F23 writer probes) Whether the guards hold `block` (a 64 KiB
+/// block number) read-only, or are about to.
+pub(crate) fn guarded_block(block: usize) -> bool {
+    PROTECTED.any(block, block + 1)
+}
+
+/// (Coder H, F23 writer probes, `crate::lockmeter`) Makes those of `blocks`
+/// (sorted) read-only that are plain read-write title memory the guards
+/// neither hold nor leave alone (the kernel writing there, a change under
+/// way); returns them. Under the guards' lock, so the guards' own view of a
+/// block is never changed.
+pub(crate) fn probe_protect(blocks: &[usize]) -> Vec<usize> {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let g = guards();
+    let mut armed = Vec::new();
+    for &block in blocks {
+        if g.protected.contains(block) || PROTECTED.any(block, block + 1) || g.left_alone(block) {
+            continue;
+        }
+        let mut old = 0;
+        // SAFETY: title memory; only its protection changes, and back below
+        // if it was not plain read-write.
+        if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } == 0 {
+            continue;
+        }
+        if old == PAGE_READWRITE {
+            armed.push(block);
+        } else {
+            // SAFETY: as above, as it was.
+            unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old) };
+        }
+    }
+    armed
+}
+
+/// (Coder H, F23 writer probes) Makes `blocks` read-write again, those the
+/// guards do not hold now.
+pub(crate) fn probe_unprotect(blocks: &[usize]) {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    if blocks.is_empty() {
+        return;
+    }
+    let g = guards();
+    for &block in blocks {
+        if g.protected.contains(block) || PROTECTED.any(block, block + 1) {
+            continue;
+        }
+        let mut old = 0;
+        // SAFETY: a block we made read-only; back to what it was.
+        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+    }
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 pub(crate) fn install() {
@@ -2960,6 +3227,22 @@ pub(crate) fn install() {
         EXCEPTION_POINTERS,
     };
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // (Coder W, diagnostics) The handler's time, by thread.
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
+        // SAFETY: the caller's.
+        let r = unsafe { on_write_timed(info) };
+        #[cfg(feature = "diagnostics")]
+        crate::copystep::thread_ns(crate::copystep::T_FAULTS, began.elapsed().as_nanos() as u64);
+        r
+    }
+
+    unsafe fn on_write_timed(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // (coder G, VICTORY_LOAD_READ_METER) A guard page of the load-read meter: noted, the access goes on.
+        // SAFETY: the exception being dispatched.
+        if unsafe { crate::loadmeter::fault(info) } {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         let _fault = crate::timeline::span("a fault looked at");
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
@@ -2993,11 +3276,17 @@ pub(crate) fn install() {
         }
         let at = r.ExceptionInformation[1];
         let block = at / BLOCK;
+        // (coder G, VICTORY_PAGE_KINDS) A title write on a GPU-only page: F24 says there is none.
+        crate::pagekinds::write_fault(at, r.ExceptionAddress as usize);
+        // (Coder H, F23 writer probes) A page the meter made read-only for a
+        // frame: the writer noted, the page writable again; then as before.
+        crate::lockmeter::probe_hit(at, context);
         if ours.is_none()
             && PROTECTED.any(block, block + 1)
             // SAFETY: the context the system passes, to go on from.
             && crate::titlewrite::store(unsafe { &mut *context }, at)
         {
+            crate::lockmeter::fault(at, r.ExceptionAddress as usize);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         // Another thread may have opened the block since this one faulted
@@ -3021,6 +3310,8 @@ pub(crate) fn install() {
             if opened != 0 {
                 g.opened(block);
                 drop(g);
+                crate::pagekinds::work(crate::pagekinds::Work::GuardFault, block * BLOCK, BLOCK, 0);
+                crate::lockmeter::fault(at, r.ExceptionAddress as usize);
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -3089,6 +3380,23 @@ mod parts_tests {
         // A page never written before: what was not named was never written.
         assert_eq!(j.note(9, 0b100, 9), 0);
         assert_eq!(j.parts_since(9, 5), 0b100);
+    }
+
+    #[test]
+    fn bits_set_in_a_range_are_listed_and_known_notes_are_newest() {
+        static B: Bits = Bits::new();
+        for b in [3, 64, 65, 200, 1 << 26] {
+            B.set(b);
+        }
+        assert_eq!(B.set_in(0, 300), vec![3, 64, 65, 200]);
+        assert_eq!(B.set_in(4, 65), vec![64]);
+        assert_eq!(B.set_in((1 << 26) - 5, (1 << 26) + 5), vec![1 << 26]);
+        assert!(B.set_in(201, 1 << 20).is_empty());
+        // (coder K) A known write is noted above every asking before it.
+        let before = asking_now();
+        note_known(&[0x7fff_0001, 0x7fff_0002]);
+        assert!(last_noted(0x7fff_0001, 0x7fff_0003) > before);
+        assert_eq!(last_noted(0x7fff_0003, 0x7fff_0004), 0);
     }
 }
 

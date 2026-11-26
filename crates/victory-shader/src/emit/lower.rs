@@ -152,9 +152,10 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 /// Whether the title dispatches the program by a count of threads whose last
 /// group may be partial: the structure builder's programs of one dimension.
 /// Their lanes past the count must not run (they count the lanes of a wave
-/// and store). Not where a group barrier would wait for lanes that left, nor
-/// where two host waves of 32 stand for a console wave (they exchange, which
-/// takes all lanes).
+/// and store). Not where a group barrier would wait for lanes that left. Where
+/// two host waves of 32 stand for a console wave (they exchange, which takes
+/// all lanes) the lanes past the count stay and are left out of memory, EXEC's
+/// ballots and the wave's reductions instead (`Lower::partial_active`).
 fn counted_in_threads(parts: &Parts) -> bool {
     let crate::native::StageIo::Cs(cs) = &parts.native.io else {
         return false;
@@ -162,8 +163,66 @@ fn counted_in_threads(parts: &Parts) -> bool {
     cs.threads[0] > 1
         && cs.threads[1..] == [1, 1]
         && crate::spill::is_spilled(parts.native)
-        && (!parts.native.wave64 || host_max_wave() >= 64)
+        && (!parts.native.wave64 || host_max_wave() >= 64 || counted_halves())
         && !parts.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier")
+}
+
+/// (Fox T, upstream 06fe22a / PR #66) `VICTORY_BVH_COUNT32=1`: a wave64 program of the
+/// structure builder dispatched by a count of threads is counted on a 32-lane host too
+/// (NVIDIA): before, its lanes past the count ran in the last group, counted in wave
+/// operations and stored. Its threads past the count stay for the halves' group barriers
+/// and are left out of memory accesses, EXEC's ballots and the wave's reductions
+/// (`Lower::partial_active`). Off: as before. A translation switch: the shader cache keys
+/// it (`shader_cache.rs`).
+pub fn counted_halves() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_COUNTED_HALVES.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_COUNT32").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`counted_halves`], for its thread only.
+    pub(super) static TEST_COUNTED_HALVES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// (Coder W) Tests' choices for [`fault_note_once`] and [`base_reuse`].
+    pub(super) static TEST_FAULT_NOTE_ONCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    pub(super) static TEST_BASE_REUSE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// (Coder W) `VICTORY_FAULT_NOTE_ONCE=1`: the fault note of an access to title memory by
+/// address (a page with no copy: its number for the host, `Lower::memory`) is not stored in
+/// a branch of its own right after the directory lookup but held to the end of the console
+/// block and stored there, in the same order, for the same lanes, at the same place: the
+/// same notes (the host reads them after the dispatch; no shader reads them). What changes:
+/// no branch and no store between one access and the next, so the loads of a record can be
+/// issued together. Inside a guarded region (a value made there does not reach the block's
+/// end) the note is stored at once, as before. Off: as before. A translation switch: the
+/// shader cache keys every `VICTORY_*` name of this crate.
+pub fn fault_note_once() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_FAULT_NOTE_ONCE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAULT_NOTE_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// (Coder W) `VICTORY_BASE_REUSE=1`: a `global_*` access whose address registers are the
+/// same values as an earlier access's in the same console block (a record read field by
+/// field: base + 64, + 76, + 80 ...) uses that access's directory entry when its page is the
+/// same one (compared per lane), and looks its own page up, in a branch, only where it is
+/// another. Exact: the entry is the page's, and the directory does not change in a dispatch.
+/// Off: as before. A translation switch (the shader cache keys it).
+pub fn base_reuse() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_BASE_REUSE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BASE_REUSE").is_some_and(|v| v == "1"))
 }
 
 /// [`lower`]; `counted`: the lanes past a dispatch's count of threads leave
@@ -349,6 +408,20 @@ struct Lower<'a> {
     root_copy: Option<V>,
     /// Whether the page [`Lower::memory`] last looked for has a copy.
     page_there: Option<V>,
+    /// (Coder W) Guarded regions open now ([`Lower::begin_guarded`]): values made inside one
+    /// do not reach past its end.
+    guard_depth: u32,
+    /// (Coder W, `VICTORY_FAULT_NOTE_ONCE=1`) Fault notes of this console block not stored
+    /// yet: (whether the lane notes, the page), stored in this order at the block's end.
+    notes_pending: Vec<(V, V)>,
+    /// (Coder W, `VICTORY_BASE_REUSE=1`) The console registers of the address the next
+    /// [`Lower::memory`] is for (set by `global_*`), and per such base in this console block
+    /// the last page looked up, its directory entry's number and start.
+    reuse_key: Option<(Value, Value)>,
+    reuse_cache: Vec<((Value, Value), V, V, V)>,
+    /// (Coder W) [`Lower::memory_parts`] is called by [`Lower::memory`] (an instruction's top
+    /// level), not by code of its own blocks (the node test's).
+    memory_top: bool,
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
@@ -429,6 +502,11 @@ struct Lower<'a> {
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
     wave_base: Option<V>,
+    /// A partial final group (`USER_DISPATCH_THREADS_X`) whose console waves are two host
+    /// waves: the threads past the count stay for the exchange's group barriers, so they
+    /// cannot leave at entry; this says which threads the console launched, and memory,
+    /// EXEC's ballots and the wave's reductions leave the others out.
+    partial_active: Option<V>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -1578,6 +1656,11 @@ impl<'a> Lower<'a> {
             coherent: HashSet::new(),
             root_copy: None,
             page_there: None,
+            guard_depth: 0,
+            notes_pending: Vec::new(),
+            reuse_key: None,
+            reuse_cache: Vec::new(),
+            memory_top: false,
             ordered: if x.native.stage == HwStage::Ps {
                 ordered_section(p)
             } else {
@@ -1646,6 +1729,7 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
+            partial_active: None,
             wave_base: None,
             flat: None,
             sums64: HashMap::new(),
@@ -1827,7 +1911,7 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&(b, i))
             .ok_or("an untracked global address")?;
-        let guard = self.guard(b, i)?;
+        let guard = self.memory_guard(b, i)?;
         let Some(Operand::Vector { reg, .. }) = *dst else {
             return Err("a global load result");
         };
@@ -2009,6 +2093,7 @@ impl<'a> Lower<'a> {
                     .get(&mask)
                     .ok_or("a wave reduction's untracked mask")?;
                 let on = self.boolean(m, c)?;
+                let on = self.launched(c, on, mask);
                 let x = self.i32_of(src)?;
                 let id = self.s.m.i32(ident);
                 return Ok(self.s.m.select(c, on, x, id));
@@ -2039,6 +2124,7 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
+        let on = self.launched(c, on, mask);
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
@@ -2377,6 +2463,9 @@ impl<'a> Lower<'a> {
         if half_views_on() {
             self.halves_only = self.places_read_as_halves();
         }
+        // (Fox T) The paired form (one host thread runs two console lanes) has no
+        // per-lane form of the partial group: such a program is lowered as before.
+        let counted = counted && (self.twin.is_none() || !self.x.native.wave64 || host_max_wave() >= 64);
         if counted {
             // Before anything else, so that wave counts, reads of the first
             // lane and stores know only the lanes that run.
@@ -2396,10 +2485,16 @@ impl<'a> Lower<'a> {
             let all = self.s.m.cmp(original, pred::EQ, limit, zero);
             let inside = self.s.m.cmp(original, pred::IULT, x, limit);
             let runs = self.s.m.bin(original, Bin::Or, all, inside);
-            let (body, done) = (self.s.m.new_block(), self.s.m.new_block());
-            self.s.m.terminate(original, Term::CondBr(runs, body, done));
-            self.s.m.terminate(done, Term::Ret);
-            self.s.entry = body;
+            if self.halves.is_some() || self.exchange.is_some() {
+                // A console wave in two host waves exchanges through group
+                // barriers, which every thread must reach: the threads stay.
+                self.partial_active = Some(runs);
+            } else {
+                let (body, done) = (self.s.m.new_block(), self.s.m.new_block());
+                self.s.m.terminate(original, Term::CondBr(runs, body, done));
+                self.s.m.terminate(done, Term::Ret);
+                self.s.entry = body;
+            }
         }
         self.find_coherent();
         let order = crate::ir::reverse_postorder(&p.blocks);
@@ -2483,6 +2578,8 @@ impl<'a> Lower<'a> {
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].1) {
                 self.lds_meeting();
             }
+            // (Coder W) What was held back for the block's end, before its tail is known.
+            self.block_done();
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
         }
@@ -3234,9 +3331,30 @@ impl<'a> Lower<'a> {
     /// With `store`, a page that is not to be written ([`super::shader::MEMORY_READ_ONLY`])
     /// is the null view.
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V) {
-        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+        // (Coder W) Called at an instruction's top level: what it makes reaches the console
+        // block's end, so its fault note may wait there and its entry be reused.
+        self.memory_top = true;
+        let (handle, _, byte) = self.memory_parts(lo, hi, guard, store, true);
+        self.memory_top = false;
+        (handle.expect("asked for"), byte)
+    }
+
+    /// (Fox T) The raw view of title memory at heap slot `slot` (as [`Lower::memory`]
+    /// makes it), in the current block.
+    pub(super) fn memory_handle(&mut self, slot: V) -> V {
         let c = self.cur;
-        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        // The builder's threads read what others of the dispatch wrote (a
+        // refit climbs from children to parents): globally coherent.
+        let coherent = if crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
+        self.s.heap_handle(c, slot, false, true, (11 | 0x1000 | coherent, 0))
+    }
+
+    /// [`Lower::memory`]: with `view` its raw view, and its heap slot and the byte in it
+    /// (the code made as before either way, the view where it always was).
+    pub(super) fn memory_parts(&mut self, lo: V, hi: V, guard: Option<V>, store: bool, view: bool) -> (Option<V>, V, V) {
+        use super::shader::{MEMORY_PAGES, MEMORY_READ_ONLY, USER_MEMORY_BASE};
+        let c = self.cur;
+        let i32t = self.s.t.i32;
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let (k16, k8) = (k(self, 16), k(self, 0xFF));
         let low = self.s.m.bin(c, Bin::LShr, lo, k16);
@@ -3250,10 +3368,72 @@ impl<'a> Lower<'a> {
             .s
             .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[page, last]);
         self.s.m.tag(page, Tag::Clamp);
-        let k3 = k(self, 3);
+        let top = std::mem::take(&mut self.memory_top) && self.guard_depth == 0;
+        let key = self.reuse_key.take().filter(|_| base_reuse() && top);
+        let cached = key.and_then(|key| self.reuse_cache.iter().rev().find(|e| e.0 == key).copied());
+        let (number, start) = match cached {
+            // (Coder W, `VICTORY_BASE_REUSE`) The same page as this base's last access: its
+            // entry; looked up anew (in a branch) only by lanes on another page. Exact: the
+            // entry is the page's, and the directory does not change during a dispatch.
+            Some((_, was_page, was_number, was_start)) => {
+                let other = self.s.m.cmp(c, pred::NE, page, was_page);
+                let gate = self.begin_guarded(Some(other));
+                let (number, start) = self.directory_entry(page);
+                let joined = self.end_guarded(gate, &[(number, was_number), (start, was_start)]);
+                (joined[0], joined[1])
+            }
+            None => self.directory_entry(page),
+        };
+        if let Some(key) = key {
+            self.reuse_cache.retain(|e| e.0 != key);
+            if self.reuse_cache.len() >= 16 {
+                self.reuse_cache.remove(0);
+            }
+            self.reuse_cache.push((key, page, number, start));
+        }
+        let c = self.cur;
+        let mask = k(self, !MEMORY_READ_ONLY);
+        let copy = self.s.m.bin(c, Bin::And, number, mask);
+        let zero = k(self, 0);
+        let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
+        if let Some(g) = guard {
+            missing = self.s.m.bin(c, Bin::And, missing, g);
+        }
+        if fault_note_once() && top {
+            // (Coder W, `VICTORY_FAULT_NOTE_ONCE`) Stored at the console block's end
+            // ([`Lower::block_done`]): the same note, with no branch between this access and
+            // the next.
+            self.notes_pending.push((missing, page));
+        } else {
+            self.fault_note(missing, page);
+        }
+        let c = self.cur;
+        self.page_there = Some(self.s.m.cmp(c, pred::NE, copy, zero));
+        let copy = if store {
+            let closed = self.s.m.cmp(c, pred::SLT, number, zero);
+            self.s.m.select(c, closed, zero, copy)
+        } else {
+            copy
+        };
+        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
+        let slot = self.s.m.bin(c, Bin::Add, base, copy);
+        let h = view.then(|| self.memory_handle(slot));
+        let k64k = k(self, 0xFFFF);
+        let within = self.s.m.bin(c, Bin::And, lo, k64k);
+        let byte = self.s.m.bin(c, Bin::Add, start, within);
+        (h, slot, byte)
+    }
+
+    /// The directory's entry of `page` (clamped): the copy's number (with its flags) and
+    /// the byte its page starts at in the copy.
+    fn directory_entry(&mut self, page: V) -> (V, V) {
+        use super::shader::SLOT_MEMORY;
+        let c = self.cur;
+        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let k3 = self.s.m.i32(3);
         let at = self.s.m.bin(c, Bin::Shl, page, k3);
         let directory = self.s.root_srv_handle(SLOT_MEMORY);
-        let (iu, both, align) = (self.s.m.undef(i32t), self.s.m.i8(3), k(self, 4));
+        let (iu, both, align) = (self.s.m.undef(i32t), self.s.m.i8(3), self.s.m.i32(4));
         let entry = self.s.op(
             c,
             "rawBufferLoad.f32",
@@ -3263,17 +3443,16 @@ impl<'a> Lower<'a> {
             &[directory, at, iu, both, align],
         );
         let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
-        let (number, start) = (self.as_int(copy), self.as_int(start));
-        let mask = k(self, !MEMORY_READ_ONLY);
-        let copy = self.s.m.bin(c, Bin::And, number, mask);
-        // A page without a copy: its number, at a place by the number. In a
-        // branch: the notes lie in the PC's memory, and a store there with
-        // every node of every ray would be most of what a trace does.
-        let zero = k(self, 0);
-        let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
-        if let Some(g) = guard {
-            missing = self.s.m.bin(c, Bin::And, missing, g);
-        }
+        (self.as_int(copy), self.as_int(start))
+    }
+
+    /// A page without a copy: its number, at a place by the number, for lanes where
+    /// `missing`. In a branch: the notes lie in the PC's memory, and a store there with
+    /// every node of every ray would be most of what a trace does.
+    fn fault_note(&mut self, missing: V, page: V) {
+        use super::shader::{MEMORY_FAULTS, SLOT_FAULTS};
+        let i32t = self.s.t.i32;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let places = k(self, MEMORY_FAULTS - 1);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let noting = self.begin_guarded(Some(missing));
@@ -3285,6 +3464,7 @@ impl<'a> Lower<'a> {
         let place = self.s.m.bin(c, Bin::Shl, place, k2);
         let void = self.s.t.void;
         let mask = self.s.m.i8(1);
+        let (iu, align) = (self.s.m.undef(i32t), k(self, 4));
         self.s.op(
             c,
             "rawBufferStore.i32",
@@ -3294,24 +3474,17 @@ impl<'a> Lower<'a> {
             &[faults, place, iu, page, iu, iu, iu, mask, align],
         );
         self.end_guarded(noting, &[]);
-        let c = self.cur;
-        self.page_there = Some(self.s.m.cmp(c, pred::NE, copy, zero));
-        let copy = if store {
-            let closed = self.s.m.cmp(c, pred::SLT, number, zero);
-            self.s.m.select(c, closed, zero, copy)
-        } else {
-            copy
-        };
-        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
-        let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        // The builder's threads read what others of the dispatch wrote (a
-        // refit climbs from children to parents): globally coherent.
-        let coherent = if crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000 | coherent, 0));
-        let k64k = k(self, 0xFFFF);
-        let within = self.s.m.bin(c, Bin::And, lo, k64k);
-        let byte = self.s.m.bin(c, Bin::Add, start, within);
-        (h, byte)
+    }
+
+    /// (Coder W) At a console block's end: the fault notes held back
+    /// (`VICTORY_FAULT_NOTE_ONCE`), stored in their order; and the bases looked up in the
+    /// block are forgotten (`VICTORY_BASE_REUSE`: an entry is used only where it was made).
+    fn block_done(&mut self) {
+        for (missing, page) in std::mem::take(&mut self.notes_pending) {
+            self.fault_note(missing, page);
+        }
+        self.reuse_cache.clear();
+        self.reuse_key = None;
     }
 
     /// The title address in the root view `src` is built around, in a program
@@ -3397,7 +3570,11 @@ impl<'a> Lower<'a> {
         };
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
-        let guard = self.guard(b, i)?;
+        let guard = self.memory_guard(b, i)?;
+        // (Coder W, `VICTORY_BASE_REUSE`) The base the offset is added to, by its registers' values.
+        if let (Some(x), Some(y)) = (inst.read(Reg::V(areg)), inst.read(Reg::V(areg + 1))) {
+            self.reuse_key = Some((x, y));
+        }
         let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
         let iu = self.s.m.undef(i32t);
         let align = self.s.m.i32(4);
@@ -3659,6 +3836,9 @@ impl<'a> Lower<'a> {
                 };
                 self.balloting.remove(&lo);
                 let (bit, upper) = bits?;
+                // (Fox T, after upstream 06fe22a) EXEC's ballot: not the threads a
+                // partial final group keeps for its barriers.
+                let bit = self.launched(at, bit, lo);
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -4407,7 +4587,12 @@ impl<'a> Lower<'a> {
             return Err(LANE_MASK);
         }
         let at = at(self)?;
-        let bit = self.boolean(m, at)?;
+        let mut bit = self.boolean(m, at)?;
+        if let Some(a) = self.partial_active {
+            // (Fox T, after upstream 06fe22a) a mask ANDed with EXEC: the threads kept
+            // for barriers have no bit
+            bit = self.s.m.bin(at, Bin::And, bit, a);
+        }
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
         self.s.flags |= flags::WAVE_OPS;
@@ -4463,12 +4648,16 @@ impl<'a> Lower<'a> {
         // what the halves exchange is "some lane speaks against" either way (for `any`:
         // some lane's `when` holds; else: some lane's does not), so a half with no lane says
         // nothing
-        let set = if any {
+        let mut set = if any {
             mine
         } else {
             let t = self.s.m.bool(true);
             self.s.m.bin(c, Bin::Xor, mine, t)
         };
+        if let Some(a) = self.partial_active {
+            // (a thread the console did not launch says nothing)
+            set = self.s.m.bin(c, Bin::And, set, a);
+        }
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
         self.s.flags |= flags::WAVE_OPS;
@@ -4548,6 +4737,25 @@ impl<'a> Lower<'a> {
         match self.x.st.guards[b][i] {
             None => Ok(None),
             Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
+        }
+    }
+
+    /// [`Self::guard`] of a memory access: not by the threads a partial final group only
+    /// keeps for its barriers ([`Self::partial_active`]).
+    fn memory_guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
+        let g = self.guard(b, i)?;
+        Ok(match (g, self.partial_active) {
+            (Some(g), Some(a)) => Some(self.s.m.bin(self.cur, Bin::And, g, a)),
+            (g, a) => g.or(a),
+        })
+    }
+
+    /// `on` (the lanes of a mask, at `at`) without the threads a partial final group keeps
+    /// for its barriers, when the mask is of EXEC's lanes (`Structured::active`).
+    fn launched(&mut self, at: usize, on: V, mask: Value) -> V {
+        match self.partial_active {
+            Some(a) if self.x.st.active.contains(&mask) => self.s.m.bin(at, Bin::And, on, a),
+            _ => on,
         }
     }
 
@@ -4674,6 +4882,7 @@ impl<'a> Lower<'a> {
     /// lane guard): returns where it started and the join block.
     fn begin_guarded(&mut self, guard: Option<V>) -> Option<(usize, usize)> {
         let g = guard?;
+        self.guard_depth += 1;
         let (then, join) = (self.s.m.new_block(), self.s.m.new_block());
         self.s.m.terminate(self.cur, Term::CondBr(g, then, join));
         let head = self.cur;
@@ -4686,6 +4895,7 @@ impl<'a> Lower<'a> {
         let Some((head, join)) = at else {
             return values.iter().map(|v| v.0).collect();
         };
+        self.guard_depth -= 1;
         let then = self.cur;
         self.s.m.terminate(then, Term::Br(join));
         self.cur = join;
@@ -5102,7 +5312,12 @@ impl<'a> Lower<'a> {
             return Err("GDS");
         }
         let name = inst.name();
-        let guard = self.guard(b, i)?;
+        // (a shuffle reads other lanes: it is not memory)
+        let guard = if name == "ds_swizzle_b32" || name.contains("permute") {
+            self.guard(b, i)?
+        } else {
+            self.memory_guard(b, i)?
+        };
         let c = self.cur;
         let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
         let dst_reg = match dst {
@@ -11008,7 +11223,7 @@ impl<'a> Lower<'a> {
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
-        let guard = self.guard(b, i)?;
+        let guard = self.memory_guard(b, i)?;
         let c = self.cur;
         let (kind, coords) = match dim {
             0 => (1, 1),
@@ -11877,7 +12092,7 @@ impl<'a> Lower<'a> {
             return Err(name);
         }
         let site = (b, i);
-        let guard = self.guard(b, i)?;
+        let guard = self.memory_guard(b, i)?;
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
@@ -13765,5 +13980,41 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+}
+
+/// (Coder W) `VICTORY_FAULT_NOTE_ONCE` / `VICTORY_BASE_REUSE` over real programs: a tool,
+/// `VICTORY_W_INSPECT=<file.cdxil>[;...]` and `--ignored w_inspect`. Each program is
+/// translated with the four settings (validated by `dxil.dll` when there, as every
+/// translation is); prints the DXIL's size and how many fault-note stores and directory
+/// lookups it has, and with `VICTORY_W_DUMP=<dir>` writes each translation there (to compare
+/// the switches-off output with a build before them, byte for byte).
+#[cfg(test)]
+mod w_tests {
+    #[test]
+    #[ignore = "a tool: VICTORY_W_INSPECT=<file.cdxil>[;...]"]
+    fn w_inspect() {
+        let Some(list) = std::env::var_os("VICTORY_W_INSPECT") else { return };
+        let dump = std::env::var_os("VICTORY_W_DUMP");
+        super::set_host_max_wave(32);
+        for file in list.to_string_lossy().split(';').filter(|f| !f.is_empty()) {
+            let bytes = std::fs::read(file).expect("the file");
+            let name = std::path::Path::new(file).file_name().unwrap().to_string_lossy().to_string();
+            for (once, reuse) in [(false, false), (true, false), (false, true), (true, true)] {
+                let was = (super::TEST_FAULT_NOTE_ONCE.replace(Some(once)), super::TEST_BASE_REUSE.replace(Some(reuse)));
+                match crate::emit::translate(&bytes) {
+                    Ok(s) => {
+                        eprintln!("{name} FAULT_NOTE_ONCE {once} BASE_REUSE {reuse}: dxil {} bytes", s.dxil.len());
+                        if let Some(dir) = &dump {
+                            let to = std::path::Path::new(dir).join(format!("{name}.{}{}.dxil", u8::from(once), u8::from(reuse)));
+                            std::fs::write(to, &s.dxil).expect("written");
+                        }
+                    }
+                    Err(e) => eprintln!("{name} FAULT_NOTE_ONCE {once} BASE_REUSE {reuse}: does not translate: {e}"),
+                }
+                super::TEST_FAULT_NOTE_ONCE.set(was.0);
+                super::TEST_BASE_REUSE.set(was.1);
+            }
+        }
     }
 }

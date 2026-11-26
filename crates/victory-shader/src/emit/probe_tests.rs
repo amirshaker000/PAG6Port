@@ -73,3 +73,70 @@ fn probe() {
         println!("{name}: {:.2} ms (least {:.2})", times[times.len() / 2], times[0]);
     }
 }
+
+/// (Fox T) A tool: `VICTORY_INSPECT=<file.cdxil>[;...]` and `--ignored inspect`: what each
+/// container's program is (wave64, threads, spilled, group barriers, ray-tracing node
+/// tests, loops) and how it translates for a 32-lane host with `VICTORY_BVH_COUNT32` off
+/// and on and `VICTORY_BVH_PAGE_REUSE` off and on: the wave size, whether it is counted in
+/// threads, and the DXIL's size.
+#[test]
+#[ignore = "a tool: VICTORY_INSPECT=<file.cdxil>[;...]"]
+fn inspect() {
+    let Some(list) = std::env::var_os("VICTORY_INSPECT") else { return };
+    super::lower::set_host_max_wave(32);
+    for file in list.to_string_lossy().split(';').filter(|f| !f.is_empty()) {
+        let bytes = std::fs::read(file).expect("the file");
+        let c = crate::Container::parse(&bytes).expect("a container");
+        let part = c.part(crate::FourCC::DXIL).or(c.part(crate::FourCC::ACCC)).expect("a program part");
+        for native in crate::native_programs(part.data).expect("programs") {
+            let Ok(p) = crate::spill::build(&native) else { continue };
+            let names: Vec<&str> = p.blocks.iter().flat_map(|b| &b.insts).map(|i| i.name()).collect();
+            let count = |n: &str| names.iter().filter(|x| x.contains(n)).count();
+            let threads = match &native.io {
+                crate::native::StageIo::Cs(cs) => Some(cs.threads),
+                _ => None,
+            };
+            eprintln!(
+                "{file}: stage {:?} wave64 {} threads {threads:?} spilled {} instructions {} s_barrier {} bvh_intersect {} global/flat loads {} buffer loads {} ds ops {} back-branches(blocks) {}",
+                native.stage,
+                native.wave64,
+                crate::spill::is_spilled(&native),
+                names.len(),
+                count("s_barrier"),
+                count("bvh"),
+                names.iter().filter(|x| (x.starts_with("global_load") || x.starts_with("flat_load"))).count(),
+                names.iter().filter(|x| x.starts_with("buffer_load") || x.starts_with("s_buffer_load")).count(),
+                names.iter().filter(|x| x.starts_with("ds_")).count(),
+                p.blocks.len(),
+            );
+            if std::env::var_os("VICTORY_INSPECT_DISASM").is_some() {
+                for (n, i) in crate::gfx10::decode(&native.code).unwrap_or_default().iter().enumerate() {
+                    eprintln!("    {n:4} {:#06x} {}", i.offset, i.text(native.wave64));
+                }
+            }
+        }
+        for (count32, reuse) in [(false, false), (true, false), (false, true)] {
+            let was = (super::lower::TEST_COUNTED_HALVES.replace(Some(count32)), super::TEST_BVH_PAGE_REUSE.replace(Some(reuse)));
+            match super::translate(&bytes) {
+                Ok(s) => eprintln!(
+                    "  COUNT32 {count32} PAGE_REUSE {reuse}: dxil {} bytes, validates {:?}, root uavs {:?}, counted in threads {}, user data {}",
+                    s.dxil.len(),
+                    super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+                        .map(|mut v| v.validate(&mut s.dxil.clone()).map_err(|e| e.to_string()))
+                        .ok(),
+                    s.root_uavs,
+                    s.user_data.iter().any(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS_X)),
+                    s.user_data.len()
+                ),
+                Err(e) => eprintln!("  COUNT32 {count32} PAGE_REUSE {reuse}: does not translate: {e}"),
+            }
+            if let Ok(s) = super::translate(&bytes)
+                && let Ok(host) = super::host::Host::new(false)
+            {
+                eprintln!("    the card makes its pipeline: {:?}", host.compute_pipeline(&s).map(|_| ()).map_err(|e| e.to_string()));
+            }
+            super::lower::TEST_COUNTED_HALVES.set(was.0);
+            super::TEST_BVH_PAGE_REUSE.set(was.1);
+        }
+    }
+}

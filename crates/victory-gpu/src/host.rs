@@ -455,6 +455,15 @@ fn sweep() {
     crate::resource::housekeeping();
 }
 
+/// (Fox V, `VICTORY_PAGE_MIGRATE`) Runs `f` with the host's queue under the
+/// submission lock: what `f` sends lies between two title submissions, with
+/// nothing of theirs between its calls. `f` must not wait for the card.
+pub(crate) fn between_submissions<R>(f: impl FnOnce(&ID3D12CommandQueue) -> R) -> Option<R> {
+    let host = host()?;
+    let _submitting = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    Some(f(&host.queue))
+}
+
 /// The number of the newest submission begun, and of the newest of which all
 /// before it have finished too.
 pub(crate) fn submissions() -> (u64, u64) {
@@ -1286,6 +1295,14 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// (Fox T) With `VICTORY_PASS_TIMES=1`: the stamps around its commands
+    /// ([`passtimes`]).
+    #[cfg(feature = "diagnostics")]
+    passes: Mutex<Option<Option<passtimes::Passes>>>,
+    /// (Fox T) With `VICTORY_BVH_WALK=1`: the node-test counts its dispatches
+    /// copied ([`walk`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) walks: walk::Taken,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -1305,6 +1322,35 @@ fn lazy_prelude() -> bool {
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
+
+/// (Fox T, diagnostics) `Host::card_before` in parts, nanoseconds: 0 what
+/// changed gathered (`card_dirty`), 1 "before" twins made, 2 the bytes taken
+/// (`send::take`), 3 the list of sends and hash passes recorded and sent, 4
+/// the compare planned and recorded; then calls, copies with changes, ranges.
+#[cfg(feature = "diagnostics")]
+static CARD_SPLIT: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// For the frame lines.
+#[cfg(feature = "diagnostics")]
+fn card_split_line(frames: f64) {
+    let v: [u64; 9] = std::array::from_fn(|i| CARD_SPLIT[i].swap(0, Ordering::Relaxed));
+    if v[6] == 0 {
+        return;
+    }
+    let f = frames.max(1.0);
+    let ms = |i: usize| v[i] as f64 / 1e6 / f;
+    tracing::info!(
+        "copies in the card's memory per frame, the submitting thread: {:.0} calls, {:.0} copies with changes, {:.0} ranges;          gathered {:.2} ms, twins made {:.2}, bytes taken {:.2}, sends and hash passes recorded {:.2}, compare planned and recorded {:.2}",
+        v[6] as f64 / f,
+        v[7] as f64 / f,
+        v[8] as f64 / f,
+        ms(0),
+        ms(1),
+        ms(2),
+        ms(3),
+        ms(4),
+    );
+}
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -3184,6 +3230,13 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
             }
         }
     }
+    #[cfg(feature = "diagnostics")]
+    if count && !placed.is_empty() {
+        // (Coder W) Named, as the other waits for what is read are.
+        if let Some((kind, at, len)) = place::read_by_who(runs, placed.clone()) {
+            blame(kind, &placed, at, len);
+        }
+    }
     (!placed.is_empty() && place::read_by(runs, placed)).then_some(WHY_READ)
 }
 
@@ -3871,6 +3924,10 @@ pub(crate) use send::{goes_as_words, words_under};
 pub(crate) use send::meter as send_meter;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod passtimes;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod walk;
 mod torn;
 #[cfg(feature = "diagnostics")]
 mod traffic;
@@ -4294,6 +4351,10 @@ impl Host {
                 notes,
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                passes: Mutex::new(None),
+                #[cfg(feature = "diagnostics")]
+                walks: Mutex::new(Vec::new()),
             })
         }
     }
@@ -4431,6 +4492,15 @@ impl Host {
         if !crate::shadow::cards() {
             return None;
         }
+        // (Fox T, diagnostics) Where the time goes ([`card_split_line`]).
+        #[cfg(feature = "diagnostics")]
+        let mut was = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let mut lap = |part: usize| {
+            let now = std::time::Instant::now();
+            CARD_SPLIT[part].fetch_add((now - was).as_nanos() as u64, Ordering::Relaxed);
+            was = now;
+        };
         // The ranges this submission's shaders may write, per copy.
         let declared: Vec<Declared> = declared.iter().filter(|(shadow, _)| shadow.carded()).cloned().collect();
         let declared = if crate::picked::lands() { crate::picked::with(declared, &picked.written) } else { declared };
@@ -4450,6 +4520,13 @@ impl Host {
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let mut dirty = crate::shadow::card_dirty(sent_as);
         gathering.end();
+        #[cfg(feature = "diagnostics")]
+        {
+            lap(0);
+            CARD_SPLIT[6].fetch_add(1, Ordering::Relaxed);
+            CARD_SPLIT[7].fetch_add(dirty.len() as u64, Ordering::Relaxed);
+            CARD_SPLIT[8].fetch_add(dirty.iter().map(|d| d.1.len() as u64).sum(), Ordering::Relaxed);
+        }
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
             return None;
         }
@@ -4470,12 +4547,16 @@ impl Host {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        lap(1);
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut looks = None;
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
+        #[cfg(feature = "diagnostics")]
+        lap(2);
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -4577,6 +4658,8 @@ impl Host {
             }
             used.push((false, sync));
         }
+        #[cfg(feature = "diagnostics")]
+        lap(3);
         drop(order);
         let mut plan = CardPlan {
             ranges: Vec::new(),
@@ -4683,6 +4766,8 @@ impl Host {
             }
             plan.lists.push((true, check));
         }
+        #[cfg(feature = "diagnostics")]
+        lap(4);
         work.out += 1;
         Some(plan)
     }
@@ -5673,6 +5758,11 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         // Or the reads are done on the card, behind the flights.
+        // (Coder W, `VICTORY_FILL_FROM_PLACED`) Fills that read a copy at its place read its source.
+        if late && place::fill_from_placed() != 0 {
+            let written = line().written.clone();
+            place::redirect_fills(runs, &written);
+        }
         let own = if late { self.card_steps(runs) } else { None };
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
@@ -5682,6 +5772,12 @@ impl Host {
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
+            // (Coder W, diagnostics) Who made this submission wait, and how long.
+            #[cfg(feature = "diagnostics")]
+            let (blame, waiting) = (
+                (why == WHY_READ).then(|| card_steps::copied_read_who(&card_steps::copies(&line()), runs)).flatten(),
+                std::time::Instant::now(),
+            );
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -5691,6 +5787,8 @@ impl Host {
             } else {
                 self.settle(&mut submitted, why);
             }
+            #[cfg(feature = "diagnostics")]
+            crate::copystep::waited_for(why, blame, waiting);
         }
         #[cfg(feature = "diagnostics")]
         ahead.part(13);
@@ -5817,6 +5915,9 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.fill();
+        if place::fill_from_placed() != 0 {
+            place::check_fills();
+        }
         stage.next("submit: the last refreshes");
         batch.flush();
         crate::watch::ask_once_end();
@@ -6463,6 +6564,10 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        if passtimes::on() {
+            passtimes::close(&self.passes, &self.list);
+        }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -6510,6 +6615,14 @@ impl HostList {
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        if passtimes::on() {
+            passtimes::reset(&self.passes);
+        }
+        #[cfg(feature = "diagnostics")]
+        if walk::on() {
+            walk::reset(&self.walks);
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -6537,6 +6650,12 @@ impl HostList {
     /// refreshed.
     pub(crate) fn changed_something(&self) {
         self.epoch.store(next_epoch(), Ordering::Relaxed);
+    }
+
+    /// (Fox T, `VICTORY_BIND_SAME=verify`) How many deferred steps the list
+    /// has queued.
+    pub(crate) fn deferred_steps(&self) -> usize {
+        self.deferred().copies.len()
     }
 
     /// See [`HostList::changed_something`].
@@ -6906,6 +7025,25 @@ impl HostList {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
         list.cast().ok()
+    }
+
+    /// (Fox T, diagnostics) A title command of `kind` named `name` (or the
+    /// layer's clamp) is about to be recorded: its stamp before
+    /// (`VICTORY_PASS_TIMES=1`; nothing without).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pass_begin(&self, kind: passtimes::Kind, name: impl FnOnce() -> std::sync::Arc<str>) {
+        if passtimes::on() {
+            passtimes::begin(&self.passes, &self.list, kind, name);
+        }
+    }
+
+    /// (Fox T, diagnostics) The command of [`HostList::pass_begin`] is
+    /// recorded: its stamp after.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pass_end(&self) {
+        if passtimes::on() {
+            passtimes::end(&self.passes, &self.list);
+        }
     }
 
     /// Notes what the command about to be recorded does, as a marker
@@ -7863,6 +8001,16 @@ struct Batch {
     once: ByCopy<(usize, usize)>,
 }
 
+/// (Coder W) `VICTORY_ASK_KEPT_EARLY=1` ([`Batch::flush_all`]).
+fn ask_kept_early() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_KEPT_EARLY").is_some_and(|v| v == "1"))
+}
+
+/// (Coder W, diagnostics) Flushes that left the ask ahead out ([`ask_kept_early`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) static KEPT_EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// (Fox port C2, from victory-dev P6; `VICTORY_PREPARE_WIDE=1`, default off =
 /// cool_fox) Fox already gathers fills and refreshes and runs them on the wide
 /// workers (run-103: 6,793 of 7,593 refreshes a frame wide; copies and fills
@@ -8213,9 +8361,17 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        if !(crate::watch::light() && shadow.nothing_new(from, to - from)) && !crate::chunks::known(shadow.id(), from, to) {
+        // (Coder W) Timed by what the refresh came to (`crate::copystep::flushed`).
+        let timed = std::time::Instant::now();
+        let kind = if crate::watch::light() && shadow.nothing_new(from, to - from) {
+            0
+        } else if crate::chunks::known(shadow.id(), from, to) {
+            1
+        } else {
             Self::update(&shadow, from, to);
-        }
+            2
+        };
+        crate::copystep::flushed(kind, timed);
         #[cfg(feature = "diagnostics")]
         {
             let ns = started.elapsed().as_nanos() as u64;
@@ -8541,7 +8697,19 @@ impl Batch {
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        // (Coder W, `VICTORY_ASK_KEPT_EARLY=1`, default off) With the submission's one asking
+        // standing (`VICTORY_ASK_ONCE`, on), `ask_ahead` returns after filtering and sorting
+        // every range and `ask_ahead_done` takes the journal's write lock to do nothing: both
+        // are left out. Exact: neither changes anything then.
+        let skip = ask_kept_early() && crate::watch::once_kept();
+        #[cfg(feature = "diagnostics")]
+        if skip && self.refreshes.len() > 1 {
+            let n = KEPT_EARLY.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() || n % 10_000 == 0 {
+                tracing::info!(n, "asks ahead left out with the submission's asking standing (VICTORY_ASK_KEPT_EARLY=1), since the start");
+            }
+        }
+        let ahead = self.refreshes.len() > 1 && !skip;
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
@@ -8640,6 +8808,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // (A title destination that is away only while the runtime changes a
     // mapping beside it is written when that is done.)
     let whole = read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
+    if title_dst {
+        // (Coder J, `VICTORY_KNOWN_WRITES`) The bytes are in: noted again (`writing` above notes before them).
+        crate::knownwrites::note(crate::knownwrites::SRC_OUR_COPY, dst as usize, len);
+    }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -8668,6 +8840,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 /// After a failed bulk read into host memory, skip contiguous holes. Never
 /// cache the query across copies: the title may remap the same address.
 fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
+    crate::pagekinds::our_read(src as usize, len);
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
     };
@@ -8782,6 +8955,8 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    let _kinds = crate::pagekinds::Timed::new(crate::pagekinds::Work::CopyFromTitle, src as usize, len);
+    crate::pagekinds::our_read(src as usize, len);
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     if crate::safecopy::on() {
@@ -9136,6 +9311,15 @@ impl Meter {
         card_clock_line(frames, ms);
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
+        #[cfg(feature = "diagnostics")]
+        passtimes::line(frames);
+        #[cfg(feature = "diagnostics")]
+        card_split_line(frames);
+        crate::draw::bind_same_line(frames);
+        crate::draw::table_memo_line(frames);
+        crate::draw::list_alias_line(frames);
+        #[cfg(feature = "diagnostics")]
+        walk::line(frames);
         crate::shadow::back_line(frames);
         #[cfg(feature = "diagnostics")]
         split_line(frames);
@@ -9358,6 +9542,7 @@ impl Meter {
                         *n as f64 / frames
                     );
                 }
+                crate::pipeline::pending_report(frames);
             }
             };
             meter_lines(lines);

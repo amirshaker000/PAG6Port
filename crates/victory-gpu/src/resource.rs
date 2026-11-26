@@ -1230,6 +1230,44 @@ struct Hosted {
     wanted: std::sync::atomic::AtomicU32,
     /// The next host copy takes the place of one with fewer levels.
     grown: std::sync::atomic::AtomicBool,
+    /// (coder K, `VICTORY_GPU_ONLY=1`) The room rule skipped its copy (the title still holds the level):
+    /// its next use counts as a copy not made again.
+    spared: std::sync::atomic::AtomicBool,
+    /// (coder K) The title freed its level and the copy stayed held for 60 s: the room rule decides for it.
+    unruled: std::sync::atomic::AtomicBool,
+    /// (coder K2) Who let its last host copy go ([`GoneBy`]), for "made again by who let go".
+    gone_by: std::sync::atomic::AtomicU8,
+    /// (coder K2) The title freed its level and the copy waits, dead, for a new level at the address.
+    dead: std::sync::atomic::AtomicBool,
+    /// (coder K2) The free (`crate::host::moment`) whose reuse in place was last counted.
+    reused_at: std::sync::atomic::AtomicU64,
+}
+
+/// (coder K2) Who let a host copy go: the idle sweep with no room needed, the room rule (a copy not under
+/// the GPU-only rule), the room rule's last pass (copies under the rule, `VICTORY_GPU_ONLY_HOLD=1`), the
+/// release at the title's free (F25), a real unmap (`VICTORY_UNMAP_EXACT`).
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub(crate) enum GoneBy {
+    Idle = 0,
+    Room = 1,
+    RoomLast = 2,
+    Free = 3,
+    Unmap = 4,
+}
+
+/// (coder K2) Since the start, per [`GoneBy`]: copies made again after that one let them go (count, bytes).
+#[cfg(windows)]
+pub(crate) static MADE_AGAIN_BY: [[std::sync::atomic::AtomicU64; 2]; 5] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 5];
+
+/// (coder K2) `VICTORY_GPU_ONLY_HOLD=1`: under room pressure the room rule takes copies under the GPU-only
+/// rule only after every other idle copy (least recently used first), and the idle sweep keeps them (the
+/// title's free ends them). `0` (default): they are left to the room rule's own order like any copy; the
+/// release at the title's free stays.
+pub(crate) fn gpu_only_hold() -> bool {
+    static HOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HOLD.get_or_init(|| matches!(std::env::var("VICTORY_GPU_ONLY_HOLD").as_deref().map(str::trim), Ok("1")))
 }
 
 /// Whether a texture the title places in memory is read, kept and uploaded
@@ -1561,9 +1599,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             // What the upload can read: a console layout, no XOR mode
             // (`crate::texture` `staging`).
             let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+            // (Fox V, `VICTORY_LEVELS_ALL=1`) Every such texture, also one
+            // that holds all its levels (on this title a level change is a
+            // new texture with only the levels held, F11, so none was ever
+            // "partly" held and the path stood idle): the speed A/B of
+            // tiled host copies, a step to a page pool of texture copies.
             let partly = readable
                 && bytes >= crate::tiles::floor()
-                && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
+                && (crate::tiles::all_levels()
+                    || !crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
             let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
@@ -1573,10 +1617,46 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t, u32::from(r.desc.mip_levels)));
             // (Both or neither: a reserved texture the card will not cut
             // into tiles is dropped here, and the old kind is made below.)
+            let had_reserved = reserved.is_some();
             if cut.is_some() {
                 tiled = cut;
                 texture = reserved;
             }
+            if crate::tiles::all_levels() {
+                use crate::tiles::Refused as R;
+                let why = if !readable {
+                    R::Layout
+                } else if bytes < crate::tiles::floor() {
+                    R::Small
+                } else if !partly {
+                    R::Held
+                } else if !had_reserved {
+                    R::Reserve
+                } else if tiled.is_none() {
+                    R::Tiling
+                } else {
+                    R::Taken
+                };
+                crate::tiles::refused(why, bytes);
+            }
+        } else if crate::tiles::all_levels() && crate::tiles::wanted() {
+            // (Fox V) Why the tiled path did not take a texture the title
+            // makes: the first test it fails.
+            use crate::tiles::Refused as R;
+            let why = if !fills(&r.desc) {
+                R::Fills
+            } else if r.desc.dimension != TEXTURE_2D {
+                R::Dimension
+            } else if r.desc.depth_or_array_size != 1 {
+                R::Array
+            } else if r.desc.mip_levels <= 1 {
+                R::OneLevel
+            } else if r.desc.sample_count > 1 {
+                R::Samples
+            } else {
+                R::NotPlaced
+            };
+            crate::tiles::refused(why, footprint(&r.desc).map_or(0, |f| f.size));
         }
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
@@ -1626,13 +1706,22 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[0].fetch_add(1, Relaxed);
             KINDS[1].fetch_add(host.bytes, Relaxed);
         }
+        // (coder K) A new copy: the lifetime rule holds for it again.
+        r.host.unruled.store(false, Relaxed);
         if r.host.gone.load(Relaxed) {
             host.remade.store(true, Relaxed);
             KINDS[4].fetch_add(1, Relaxed);
             KINDS[5].fetch_add(host.bytes, Relaxed);
+            let by = &MADE_AGAIN_BY[usize::from(r.host.gone_by.load(Relaxed)).min(4)];
+            by[0].fetch_add(1, Relaxed);
+            by[1].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
+        // (Fox V, `VICTORY_PAGE_MIGRATE`) A copy on pages knows its record.
+        if let Some((host, _)) = made.as_ref() {
+            crate::pool::pages_adopt(host);
+        }
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
@@ -1640,6 +1729,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     let now = crate::host::moment();
     if r.host.used.load(Relaxed) != now {
         r.host.used.store(now, Relaxed);
+        if r.host.spared.load(Relaxed) && r.host.spared.swap(false, Relaxed) {
+            crate::pagekinds::LIFE[10].fetch_add(1, Relaxed);
+        }
     }
     made.clone()
 }
@@ -1788,6 +1880,43 @@ pub(crate) fn placed_known(address: u64, desc: &[u32; 14]) -> Option<This> {
     key[13] = 0;
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     map.get(&(address, key)).or_else(|| map.get(&(address, *desc))).map(|&r| r as This)
+}
+
+/// (coder G, `VICTORY_PAGE_KINDS`) Host copies of placed textures alive that the title fills: title address,
+/// title bytes, the copy's serial, host bytes.
+#[cfg(windows)]
+pub(crate) fn placed_copies() -> Vec<(u64, u64, u64, u64)> {
+    let all: Vec<usize> = textures().iter().copied().collect();
+    let mut out = Vec::new();
+    for at in all {
+        // SAFETY: as in `census`: the table holds live resources.
+        let r = unsafe { &*(at as *const Resource) };
+        if !r.host.placed.load(std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((host, _)) = made.as_ref()
+            && host.filled
+        {
+            let len = footprint(&r.desc).map_or(0, |f| f.size);
+            out.push((r.data() as u64, len, host.serial, host.bytes));
+        }
+    }
+    out
+}
+
+/// (coder G, `VICTORY_PAGE_KINDS`) The serial of a host copy alive of a placed texture at `[at, at + len)`.
+#[cfg(windows)]
+pub(crate) fn placed_copy_in(at: u64, len: u64) -> Option<u64> {
+    let found: Vec<usize> = {
+        let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        map.range((at, [0u32; 14])..(at + len.max(1), [0u32; 14])).map(|(_, &r)| r).collect()
+    };
+    found.into_iter().find_map(|r| {
+        // SAFETY: placed textures are kept for the run.
+        let r = unsafe { &*(r as *const Resource) };
+        r.host.made.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(h, _)| h.serial)
+    })
 }
 
 /// For the card accounting line: whether title texture `this` has a host
@@ -2040,6 +2169,13 @@ pub(crate) fn let_go_idle() {
     // really unmapped go first, whatever the room rule says.
     let_go_unmapped();
     let memory = crate::host::host().and_then(|h| h.video_memory());
+    // (coder K2) `VICTORY_GPU_ONLY_HOLD=1`: copies all on GPU-only pages are the title's to end (its free):
+    // the idle sweep keeps them; under room pressure the room rule takes them only after every other idle
+    // copy, least recently used first (no budget valve: the order is the valve). (f7c9cac's valve went by
+    // the raw use, which counts the free space of our texture blocks and sat past 97 % of the budget for
+    // most of run-148/149: the rule held nothing against the room rule there, and "let go past 97 %"
+    // counted rule copies the sweep looked at, each sweep again, not copies let go.)
+    let hold = crate::pagekinds::lifetime_on() && gpu_only_hold();
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
@@ -2055,9 +2191,13 @@ pub(crate) fn let_go_idle() {
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
     let by_room = most != u64::MAX;
+    // (coder K, K2, `VICTORY_GPU_ONLY=1`) Copies of levels the title freed: dead until the address holds a new
+    // level of the same description (used again: re-filled in place) or they time out; under room pressure
+    // they are the first the room rule takes.
+    let freed_bytes = let_go_freed(most);
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
-    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    let (mut went, mut bytes, mut first) = (0u64, freed_bytes, None);
     let all = textures();
     // With a limit, the longest idle first.
     let mut by_age: Vec<(u64, usize)> = Vec::new();
@@ -2106,22 +2246,8 @@ pub(crate) fn let_go_idle() {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
-        if bytes >= most {
-            break;
-        }
-        looked += 1;
-        if part == PART {
-            FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
-        }
-        // SAFETY: a texture leaves the table before it is freed, under the
-        // lock held here (`Drop for Resource`).
-        let r = unsafe { &*(at as *const Resource) };
-        // (Without its lock first: most were used lately or have none.)
-        let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
-            continue;
-        }
+    // (coder K2) Lets `at`'s host copy go if it is idle and held by nothing else: its bytes.
+    let let_go = |at: usize, r: &Resource, by: GoneBy| -> Option<u64> {
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
@@ -2139,26 +2265,97 @@ pub(crate) fn let_go_idle() {
                 None
             }
         };
-        if let Some((host, _)) = gone {
-            if let Some(o) = &occupancy
-                && o.used_of(windows::core::Interface::as_raw(&host.texture) as usize).is_some_and(|u| u * 2 < 64 << 20)
-            {
-                crate::pool::PACKED[0].fetch_add(1, Relaxed);
-                crate::pool::PACKED[1].fetch_add(host.bytes, Relaxed);
+        let (host, _) = gone?;
+        if let Some(o) = &occupancy
+            && o.used_of(windows::core::Interface::as_raw(&host.texture) as usize).is_some_and(|u| u * 2 < 64 << 20)
+        {
+            crate::pool::PACKED[0].fetch_add(1, Relaxed);
+            crate::pool::PACKED[1].fetch_add(host.bytes, Relaxed);
+        }
+        r.host.gone.store(true, Relaxed);
+        r.host.gone_by.store(by as u8, Relaxed);
+        KINDS[2].fetch_add(1, Relaxed);
+        KINDS[3].fetch_add(host.bytes, Relaxed);
+        if by_room {
+            ROOM_LET_GO[0].fetch_add(1, Relaxed);
+            ROOM_LET_GO[1].fetch_add(host.bytes, Relaxed);
+        }
+        let b = host.bytes;
+        crate::host::retire(host);
+        Some(b)
+    };
+    // (coder K2, `VICTORY_GPU_ONLY_HOLD=1`) Idle copies under the rule the room rule passed over, in its
+    // order (least recently used first): taken only when the others did not make the room.
+    let mut last: Vec<usize> = Vec::new();
+    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
+        if bytes >= most {
+            break;
+        }
+        looked += 1;
+        if part == PART {
+            FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
+        }
+        // SAFETY: a texture leaves the table before it is freed, under the
+        // lock held here (`Drop for Resource`).
+        let r = unsafe { &*(at as *const Resource) };
+        // (Without its lock first: most were used lately or have none.)
+        let used = r.host.used.load(Relaxed);
+        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        // Under the rule (asked only where it decides something: holding, or counting the room rule's).
+        let ruled = (hold || by_room)
+            && crate::pagekinds::lifetime_on()
+            && r.host.placed.load(Relaxed)
+            && !r.host.unruled.load(Relaxed)
+            && {
+                let start = r.data() as usize;
+                let size = footprint(&r.desc).map_or(0, |f| f.size) as usize;
+                crate::pagekinds::exempt(start, start + size)
+            };
+        if ruled && hold {
+            let host_bytes = r.host.made.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(h, _)| h.bytes);
+            if let Some(b) = host_bytes {
+                if !r.host.spared.swap(true, Relaxed) {
+                    crate::pagekinds::LIFE[6].fetch_add(1, Relaxed);
+                    crate::pagekinds::LIFE[7].fetch_add(b, Relaxed);
+                }
+                if by_room {
+                    last.push(at);
+                }
             }
-            r.host.gone.store(true, Relaxed);
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
-            if by_room {
-                ROOM_LET_GO[0].fetch_add(1, Relaxed);
-                ROOM_LET_GO[1].fetch_add(host.bytes, Relaxed);
+            continue;
+        }
+        let by = if by_room { GoneBy::Room } else { GoneBy::Idle };
+        if let Some(b) = let_go(at, r, by) {
+            if ruled {
+                crate::pagekinds::LIFE[8].fetch_add(1, Relaxed);
+                crate::pagekinds::LIFE[9].fetch_add(b, Relaxed);
             }
             went += 1;
-            bytes += host.bytes;
+            bytes += b;
             if first.is_none() {
                 first = Some(at);
             }
-            crate::host::retire(host);
+        }
+    }
+    // The room rule's last pass: copies under the rule, least recently used first, only for the room the
+    // others did not make.
+    for at in last {
+        if bytes >= most {
+            break;
+        }
+        // SAFETY: as above (the table's lock is still held).
+        let r = unsafe { &*(at as *const Resource) };
+        if let Some(b) = let_go(at, r, GoneBy::RoomLast) {
+            r.host.spared.store(false, Relaxed);
+            crate::pagekinds::LIFE[8].fetch_add(1, Relaxed);
+            crate::pagekinds::LIFE[9].fetch_add(b, Relaxed);
+            went += 1;
+            bytes += b;
+            if first.is_none() {
+                first = Some(at);
+            }
         }
     }
     if by_room {
@@ -2176,6 +2373,236 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// (coder K, `VICTORY_GPU_ONLY=1`, F25; K2: dead, not destroyed) The copies of placed textures that start in a
+/// level the title freed (0x1403716a0) on GPU-only pages are marked dead, not released: the slab hands the same
+/// address out again to a level of the same size class moments later (run-153: two thirds of all copies made
+/// again were copies released at a free), and a new level of the same description there is the same title
+/// texture (`PLACED_TEXTURES` is keyed by address and description), whose host copy takes its pages again from
+/// the alloc's note (`crate::pagekinds::level_allocated`) and is re-filled in place: one upload, no destroy and
+/// create, no heap hole: the path every reused address takes without the rule. A dead copy is released, if
+/// nothing holds it (no list, no slot), once `VICTORY_GPU_ONLY_DEAD_S` seconds (default 10) passed with no use
+/// since the free, or at once under room pressure (`most` bytes wanted: dead copies go before any live one);
+/// held ones are looked at again at the next sweep, past 60 s they are left to the room rule (counted).
+/// Returns the bytes released under room pressure (counted against `most` by the room rule).
+#[cfg(windows)]
+fn let_go_freed(most: u64) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !crate::pagekinds::lifetime_on() {
+        return 0;
+    }
+    let freed = crate::pagekinds::take_freed();
+    if freed.is_empty() {
+        return 0;
+    }
+    static DEAD_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // `VICTORY_GPU_ONLY_LIFETIME=free`: released at the free (no dead time).
+    let dead_ms = if crate::pagekinds::lifetime_mode() == 1 {
+        0
+    } else {
+        *DEAD_MS.get_or_init(|| {
+            std::env::var("VICTORY_GPU_ONLY_DEAD_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(10) * 1000
+        })
+    };
+    let pressure = most != u64::MAX;
+    let mut released_bytes = 0u64;
+    let mut again = Vec::new();
+    for (at, len, when) in freed {
+        // Held for 60 s since the free: left to the room rule (counted), not looked at again.
+        let given_up = crate::host::long_ago(when, 60_000, 4);
+        let expired = crate::host::long_ago(when, dead_ms, 4);
+        let found: Vec<usize> = {
+            let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+            map.range((at, [0u32; 14])..(at + len.max(1), [0u32; 14])).map(|(_, &r)| r).collect()
+        };
+        let mut released = false;
+        let mut keep = false;
+        for this in found {
+            // SAFETY: placed textures are kept for the run.
+            let r = unsafe { &*(this as *const Resource) };
+            if !fills(&r.desc) || crate::texture::host_wrote(this) {
+                continue;
+            }
+            let host_bytes = r.host.made.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(h, _)| h.bytes);
+            if r.host.used.load(Relaxed) > when {
+                // Used since the free: a new level of the same description at the address, re-filled in place.
+                r.host.dead.store(false, Relaxed);
+                if r.host.reused_at.swap(when, Relaxed) != when {
+                    crate::pagekinds::LIFE[5].fetch_add(1, Relaxed);
+                    crate::pagekinds::LIFE[12].fetch_add(host_bytes.unwrap_or(0), Relaxed);
+                }
+                continue;
+            }
+            if host_bytes.is_none() {
+                r.host.dead.store(false, Relaxed);
+                continue;
+            }
+            if !r.host.dead.swap(true, Relaxed) {
+                crate::pagekinds::LIFE[11].fetch_add(1, Relaxed);
+            }
+            let by_room = pressure && released_bytes < most;
+            if !expired && !by_room {
+                keep = true;
+                continue;
+            }
+            let gone = {
+                let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+                match made.as_ref() {
+                    None => None,
+                    Some((host, _))
+                        if r.host.used.load(Relaxed) <= when
+                            && std::sync::Arc::strong_count(host) == 1
+                            && crate::host::references(&host.texture) == 1 =>
+                    {
+                        crate::texture::unstage(this as This);
+                        r.host.wanted.store(u32::MAX, Relaxed);
+                        made.take()
+                    }
+                    Some(_) => {
+                        if given_up {
+                            r.host.unruled.store(true, Relaxed);
+                            r.host.dead.store(false, Relaxed);
+                            crate::pagekinds::FALLBACK[1].fetch_add(1, Relaxed);
+                        } else {
+                            keep = true;
+                        }
+                        None
+                    }
+                }
+            };
+            if let Some((host, _)) = gone {
+                r.host.gone.store(true, Relaxed);
+                r.host.gone_by.store(GoneBy::Free as u8, Relaxed);
+                r.host.dead.store(false, Relaxed);
+                r.host.spared.store(false, Relaxed);
+                r.host.unruled.store(false, Relaxed);
+                KINDS[2].fetch_add(1, Relaxed);
+                KINDS[3].fetch_add(host.bytes, Relaxed);
+                crate::pagekinds::LIFE[2].fetch_add(1, Relaxed);
+                crate::pagekinds::LIFE[3].fetch_add(host.bytes, Relaxed);
+                let i = if expired { 13 } else { 15 };
+                crate::pagekinds::LIFE[i].fetch_add(1, Relaxed);
+                crate::pagekinds::LIFE[i + 1].fetch_add(host.bytes, Relaxed);
+                if pressure {
+                    released_bytes += host.bytes;
+                    ROOM_LET_GO[0].fetch_add(1, Relaxed);
+                    ROOM_LET_GO[1].fetch_add(host.bytes, Relaxed);
+                }
+                crate::pagekinds::released_at_free(
+                    r.data() as u64,
+                    host.holds.lock().unwrap_or_else(|e| e.into_inner()).map(|h| h.1),
+                );
+                released = true;
+                crate::host::retire(host);
+            }
+        }
+        if released {
+            crate::pagekinds::LIFE[1].fetch_add(1, Relaxed);
+        }
+        if keep {
+            crate::pagekinds::LIFE[4].fetch_add(1, Relaxed);
+            again.push((at, len, when));
+        }
+    }
+    crate::pagekinds::keep_freed(again);
+    released_bytes
+}
+
+/// (coder K, `VICTORY_GPU_ONLY=1` safety net) Host copies of placed textures from address `from` on, up to
+/// `most` bytes of title memory: start, bytes the held digest covers, serial, the digest (`None`: nothing
+/// held yet), the title resource.
+#[cfg(windows)]
+pub(crate) fn rule_copies(from: u64, most: u64) -> Vec<(u64, u64, u64, Option<crate::texture::Digest>, usize)> {
+    let found: Vec<usize> = {
+        let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        map.range((from, [0u32; 14])..).map(|(_, &r)| r).take(4096).collect()
+    };
+    let mut out = Vec::new();
+    let mut bytes = 0;
+    for this in found {
+        if bytes >= most {
+            break;
+        }
+        // SAFETY: placed textures are kept for the run.
+        let r = unsafe { &*(this as *const Resource) };
+        if !fills(&r.desc) {
+            continue;
+        }
+        let start = r.data() as u64;
+        let Some((serial, held)) = r.host.made.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(h, _)| {
+            (h.serial, *h.holds.lock().unwrap_or_else(|e| e.into_inner()))
+        }) else {
+            continue;
+        };
+        let Some((level, digest)) = held else {
+            out.push((start, 0, serial, None, this));
+            continue;
+        };
+        let Some(layout) = texture_layout(&r.desc) else {
+            continue;
+        };
+        let len = layout.planes[0].layout.bytes_from(level);
+        if !crate::pagekinds::exempt(start as usize, (start + len) as usize) {
+            continue;
+        }
+        bytes += len;
+        out.push((start, len, serial, Some(digest), this));
+    }
+    out
+}
+
+/// (coder K, `VICTORY_PAGE_KINDS` touch sampling) Whether a host copy of a placed texture covers address `at`.
+#[cfg(windows)]
+pub(crate) fn texture_copy_over(at: u64) -> bool {
+    let found: Vec<usize> = {
+        let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        map.range(..(at + 1, [0u32; 14])).rev().take(16).map(|(_, &r)| r).collect()
+    };
+    found.into_iter().any(|this| {
+        // SAFETY: placed textures are kept for the run.
+        let r = unsafe { &*(this as *const Resource) };
+        let start = r.data() as u64;
+        start <= at
+            && start + footprint(&r.desc).map_or(0, |f| f.size) > at
+            && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    })
+}
+
+/// (coder K) Host copies of placed textures whose whole source lies under the `VICTORY_GPU_ONLY=1` rule:
+/// count and host bytes.
+#[cfg(windows)]
+pub(crate) fn rule_census() -> (u64, u64, [u64; 4]) {
+    use crate::pagekinds::Verdict;
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let (mut n, mut bytes) = (0, 0);
+    // Copies all on GPU-only pages by the table refused: given back, shown also at a CPU-mapped CPU-view
+    // address, at another GPU-view address, outside the region.
+    let mut refused = [0u64; 4];
+    for (at, len, _, host) in placed_copies() {
+        match crate::pagekinds::verdict(at as usize, (at + len) as usize) {
+            Verdict::Under => {
+                n += 1;
+                bytes += host;
+            }
+            Verdict::NotGpuOnly => {}
+            Verdict::Kept => refused[0] += 1,
+            Verdict::Twice(class, other) => {
+                refused[1 + usize::from(class)] += 1;
+                if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                    tracing::info!(
+                        at = format_args!("{at:#x}"),
+                        len,
+                        other = format_args!("{other:#x}"),
+                        class,
+                        whose = %crate::pagekinds::describe(other),
+                        "VICTORY_GPU_ONLY=1: a copy all on GPU-only pages refused: a page of it is shown at another address too (0 CPU view CPU-mapped by the table, 1 GPU view, 2 outside the region)"
+                    );
+                }
+            }
+        }
+    }
+    (n, bytes, refused)
 }
 
 /// Since the start: copies the room rule let go (`vram_keep` past 88 % of
@@ -2415,6 +2842,7 @@ fn let_go_unmapped() {
             };
             if let Some((host, _)) = gone {
                 r.host.gone.store(true, Relaxed);
+                r.host.gone_by.store(GoneBy::Unmap as u8, Relaxed);
                 KINDS[2].fetch_add(1, Relaxed);
                 KINDS[3].fetch_add(host.bytes, Relaxed);
                 went += 1;
@@ -2561,6 +2989,31 @@ pub(crate) fn housekeeping() {
             _ => "0",
         },
     );
+    // (coder K2) Made again, by who let the copy go.
+    {
+        let by: [[u64; 2]; 5] = std::array::from_fn(|i| [MADE_AGAIN_BY[i][0].load(Relaxed), MADE_AGAIN_BY[i][1].load(Relaxed)]);
+        tracing::info!(
+            "memory housekeeping, made again by who let the copy go, since the start: idle sweep {} ({} MB), room rule {} ({} MB), \
+             room rule's last pass (copies under the GPU-only rule, VICTORY_GPU_ONLY_HOLD={}) {} ({} MB), release at the title's free {} ({} MB), \
+             real unmap {} ({} MB)",
+            by[0][0],
+            mb(by[0][1]),
+            by[1][0],
+            mb(by[1][1]),
+            u8::from(gpu_only_hold()),
+            by[2][0],
+            mb(by[2][1]),
+            by[3][0],
+            mb(by[3][1]),
+            by[4][0],
+            mb(by[4][1]),
+        );
+    }
+    // (Fox F, `VICTORY_POOL_CLASSES`) Texture blocks by size class.
+    #[cfg(feature = "diagnostics")]
+    if crate::pool::classes().is_some() {
+        tracing::info!("memory housekeeping, {}", crate::pool::classes_line(budget, raw, net));
+    }
 }
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
@@ -2764,6 +3217,7 @@ impl Drop for HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
+        crate::pagekinds::copy_gone(self.serial);
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
@@ -3122,6 +3576,11 @@ fn hand_out_resource(
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             grown: std::sync::atomic::AtomicBool::new(false),
+            spared: std::sync::atomic::AtomicBool::new(false),
+            unruled: std::sync::atomic::AtomicBool::new(false),
+            gone_by: std::sync::atomic::AtomicU8::new(0),
+            dead: std::sync::atomic::AtomicBool::new(false),
+            reused_at: std::sync::atomic::AtomicU64::new(0),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).

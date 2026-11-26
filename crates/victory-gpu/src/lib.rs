@@ -24,6 +24,7 @@ mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+mod copystep; // (coder W) VICTORY_REFRESH_ACCOUNT=1 (per-copy refresh account)
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]
@@ -38,6 +39,8 @@ pub mod frame;
 pub mod chunks; // (fox port A) F21 arena chunk meter (VICTORY_CHUNK_METER)
 #[cfg(windows)] pub mod framelog; // (fox port A) frame log, VICTORY_FRAME_LOG
 pub mod hangwatch; // (fox port A) VICTORY_HANG_WATCH_S
+pub mod lockmeter; // (coder H) F23 engine buffer lock meter (VICTORY_LOCK_METER)
+pub mod knownwrites; // (coder J) own dirty ledger for buffer copies (VICTORY_KNOWN_WRITES=verify|1)
 pub mod hlehooks; // (fox port A) runtime notes with no fox GPU function yet (title_memory_unmapped)
 #[cfg(windows)] pub mod shell; // (fox port A) caption text and the game's logo icons
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -99,6 +102,10 @@ mod upload;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
+pub mod loadmeter; // (coder G) VICTORY_LOAD_READ_METER
+#[cfg(windows)]
+pub mod pagekinds; // (coder G) VICTORY_PAGE_KINDS (F24/F25)
+#[cfg(windows)]
 mod texback;
 // (Fox port C2) F11 texture detail meter (VICTORY_TEXTURE_DETAIL, off by default).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -130,5 +137,6 @@ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_secti
 pub use watch::{
     kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
     Remapping, title_memory_remapping, title_memory_remapping_in, remap_notes_take, title_memory_splitting, title_memory_unmapping, title_memory_written,
-    writing as kernel_will_write,
 };
+#[cfg(windows)]
+pub use lockmeter::kernel_will_write; // (coder H) watch::writing, noted for the F23 meter first

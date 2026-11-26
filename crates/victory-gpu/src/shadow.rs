@@ -53,6 +53,9 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// (Coder W, `VICTORY_CLEAN_STAMP`) The last range [`Shadow::nothing_new`] found clean,
+    /// with `crate::watch::write_gen` read before it looked: (count, from, to); count 0 = none.
+    clean: Mutex<(u64, usize, usize)>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -2281,6 +2284,14 @@ fn under_wide() -> bool {
 /// shortcut: a piece with very many runs has them joined over small gaps,
 /// where the old race is left.
 fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
+    let put = put_changed_noted(at, title, merged);
+    // (Coder J, `VICTORY_KNOWN_WRITES`) Noted again once the bytes are in:
+    // `watch::landing` notes before them.
+    crate::knownwrites::landed(at, title.len());
+    put
+}
+
+fn put_changed_noted(at: usize, title: &[u8], merged: &[u8]) -> usize {
     crate::watch::landing(at, title.len());
     if !exact_back() {
         crate::host::write_mapped(at as *mut u8, merged.as_ptr(), merged.len());
@@ -2963,15 +2974,25 @@ pub(crate) fn let_go_idle() {
             return;
         }
         let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        // (Fox F, `VICTORY_WINDOW_COVERED=1`) Windows that lie wholly in
+        // another alive one: no ask takes them again while it lives.
+        let covered = if window_covered() && fine() { covered_windows(map.keys().copied()) } else { Default::default() };
         let idle: Vec<(u64, u64)> = map
             .iter()
-            .filter(|(_, s)| {
+            .filter(|(key, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                    && crate::host::long_ago(
+                        s.used.load(Ordering::Relaxed),
+                        // (A covered window `find` still names by its ask
+                        // is made again: those used in the last second stay.)
+                        if covered.contains(*key) { idle_ms.min(1000) } else { idle_ms },
+                        IDLE_FRAMES,
+                    )
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)
             .collect();
+        COVERED_LET_GO.fetch_add(idle.iter().filter(|k| covered.contains(*k)).count() as u64, Ordering::Relaxed);
         idle.into_iter().filter_map(|key| map.remove(&key)).collect()
     };
     if !gone.is_empty() {
@@ -2987,6 +3008,52 @@ pub(crate) fn let_go_idle() {
         // submission is running after all.
         crate::host::retire(shadow);
     }
+}
+
+/// (Fox F, memory audit item 3; `VICTORY_WINDOW_COVERED=1`, default off) With
+/// finer windows or tails ([`fine`]), a window that lies wholly inside another
+/// alive window goes at the next sweep once nothing holds it, not after the
+/// idle time: an ask takes the longest window that holds its range
+/// ([`holder`], [`longest_tail`]), so the covered one is never handed out
+/// again while the other lives. Run-128 (1 MiB grid, tails): 2,966 MB of
+/// windows over 1,982 MB of title memory.
+pub(crate) fn window_covered() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_COVERED").is_some_and(|v| v == "1"))
+}
+
+/// Windows let go as covered since the start ([`window_covered`]).
+pub(crate) static COVERED_LET_GO: AtomicU64 = AtomicU64::new(0);
+
+/// Of `windows` (start, bytes; in order), those wholly inside another that
+/// an ask of theirs would take instead: one that begins in the same 4 MiB
+/// cell at or below it ([`holder`] passes over those of a cell below), and
+/// for one that ends where its cell ends (a tail, perhaps) one that ends
+/// there too ([`longest_tail`] takes only those).
+fn covered_windows(windows: impl Iterator<Item = (u64, u64)>) -> std::collections::HashSet<(u64, u64)> {
+    let keys: Vec<(u64, u64)> = windows.collect();
+    let mut out = std::collections::HashSet::new();
+    // Of the earlier windows of the cell: the furthest end, and whether one
+    // ends where the cell ends.
+    let (mut cell_at, mut reach, mut tail) = (u64::MAX, 0u64, false);
+    for (i, &(start, len)) in keys.iter().enumerate() {
+        let (end, cell) = (start + len, start & !(WINDOW - 1));
+        if cell != cell_at {
+            (cell_at, reach, tail) = (cell, 0, false);
+        }
+        let cell_end = cell + WINDOW;
+        let covered = if end == cell_end {
+            tail
+        } else {
+            reach >= end || keys.get(i + 1).is_some_and(|&(s, _)| s == start)
+        };
+        if covered {
+            out.insert((start, len));
+        }
+        reach = reach.max(end);
+        tail |= end == cell_end;
+    }
+    out
 }
 
 /// (Fox port C, from victory-dev) Whether windows of title memory outside
@@ -3238,6 +3305,7 @@ impl Shadow {
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            clean: Mutex::new((0, 0, 0)),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3302,6 +3370,8 @@ impl Shadow {
         }
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        // (Coder W) Shaders may write it now: what was found clean is not known any more.
+        *self.clean.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0, 0);
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
         if relay() {
@@ -4023,12 +4093,35 @@ impl Shadow {
         if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
             return false;
         }
+        // (Coder W, `VICTORY_CLEAN_STAMP=1|verify`) Found clean before, and nothing it rests
+        // on changed since: clean, with no other lock, no walk.
+        let stamp = crate::copystep::clean_stamp();
+        let generation = crate::watch::write_gen();
+        let stamped = stamp != 0 && {
+            let c = *self.clean.lock().unwrap_or_else(|e| e.into_inner());
+            c.0 == generation && c.1 <= from && to <= c.2
+        };
+        if stamped && stamp == 1 {
+            crate::copystep::stamp_count(crate::copystep::S_HIT, 1);
+            return true;
+        }
+        let looked = std::time::Instant::now();
         // Around ranges shaders are writing the refresh asks gap by gap.
         if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+            crate::copystep::stamp_looked(stamped, false, looked);
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        drop(copied);
+        crate::copystep::stamp_looked(stamped, same, looked);
+        if same && stamp != 0 {
+            let mut c = self.clean.lock().unwrap_or_else(|e| e.into_inner());
+            // (A wider range found clean at the same count is kept.)
+            if !(c.0 == generation && c.1 <= from && to <= c.2) {
+                *c = (generation, from, to);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -4048,13 +4141,42 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        let filter = crate::knownwrites::filter_on();
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            // (Coder J, `VICTORY_KNOWN_WRITES=1`) Pages the ledger answers are left out of the asking.
+            // (Merge foxM) Order of evaluation when both features are on, per refresh of a watched copy:
+            //   1. KNOWN_WRITES (`update_filtered`): pages event-covered and unmarked since their take are
+            //      spared here, never asked (its diag safety compare samples them first);
+            //   2. the rest go to `watch::writes` in runs; there `VICTORY_GPU_ONLY=1` answers a run lying
+            //      wholly on GPU-only pages from the journal (no write-watch ask, no guard; its safety net
+            //      and `pagekinds::known` notes stand as without KNOWN_WRITES);
+            //   3. anything else: today's write-watch / guard tracking.
+            // A page spared by EITHER rule is not asked. Every GPU_ONLY journal note (`watch::note_known`)
+            // also marks the KNOWN_WRITES ledger, so step 1 never spares what step 2 calls written and its
+            // verify does not count those notes as misses.
+            if filter {
+                crate::knownwrites::count(crate::knownwrites::F_OFFERED, 1);
+                if let Some(copied) = self.update_filtered(from, to) {
+                    return copied;
+                }
+            }
+            let asking = filter.then(std::time::Instant::now);
+            // (Coder W, `VICTORY_REFRESH_ACCOUNT=1`) Per copy: time, bytes taken, why pages were taken again.
+            let accounted = crate::copystep::account_on().then(std::time::Instant::now);
+            let answer = crate::watch::writes(from, to, true);
+            if let Some(asking) = asking {
+                crate::knownwrites::count(crate::knownwrites::F_BASE_ASKS, 1);
+                crate::knownwrites::count(crate::knownwrites::F_BASE_NS, asking.elapsed().as_nanos() as u64);
+            }
+            if let Some((now, written)) = answer {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 self.refresh_check(from, to);
+                if let Some(at) = accounted {
+                    crate::copystep::refreshed(self.start, self.len, (to - from) as u64, copied as u64, at.elapsed().as_nanos() as u64);
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -4064,15 +4186,141 @@ impl Shadow {
                 return copied;
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+        } else if filter {
+            crate::knownwrites::count(crate::knownwrites::F_OFFERED, 1);
+            crate::knownwrites::not_filtered(crate::knownwrites::NOT_WATCHED);
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
+        crate::lockmeter::whole(from, to);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
+    }
+
+    /// (Coder J, `VICTORY_KNOWN_WRITES=1`) [`Shadow::update_free`] of a
+    /// watched range with the ledger as a filter: pages taken before that the
+    /// ledger has event-covered and unmarked since their take are not written
+    /// (`knownwrites::spared`) and are neither asked about nor taken; the
+    /// rest, in runs (spared gaps of up to 8 pages inside a run are asked
+    /// with it), go the usual way. With diagnostics a spared page is now and
+    /// then compared with the copy (safety compare): one that differs is
+    /// taken and its copy watched whole from then on. `None`: nothing spared
+    /// (the usual path follows).
+    fn update_filtered(&self, from: usize, to: usize) -> Option<usize> {
+        // Standing aside (cost limit) or windows overflowed: counted, today's tracking.
+        if !crate::knownwrites::gate() {
+            return None;
+        }
+        let gap = crate::knownwrites::gap();
+        let base = self.start as usize / PAGE;
+        let (first, last) = (from / PAGE, (to - 1) / PAGE);
+        let pages: Vec<(usize, u64)> = {
+            let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let ranged = if crate::watch::light() { self.ranged(from, to) } else { 0 };
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            (first..=last)
+                .map(|page| {
+                    // Only whole pages of the copy are noted as taken.
+                    let whole = (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to;
+                    let taken = copied.get(page - base).copied().unwrap_or(0).max(ranged);
+                    (page, if whole { taken } else { 0 })
+                })
+                .collect()
+        };
+        let mut spared = crate::knownwrites::spared(&pages, from, to);
+        // (Its reason is counted there.)
+        if !spared.iter().any(|&s| s) {
+            return None;
+        }
+        use crate::knownwrites::{F_ASK_NS, F_ASKS, F_BYTES, F_GAP, F_NO_ASK, F_PAGES, F_REFRESHES, count};
+        count(F_REFRESHES, 1);
+        let clip = |page: usize| ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+        // The safety compare (diagnostics): spared pages that differ from the copy are taken.
+        let mut stale: Vec<(usize, usize)> = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        {
+            let start = self.start as usize;
+            let kind = crate::lockmeter::kind(self.window, self.mapped, self.card.is_some());
+            for (k, &(page, _)) in pages.iter().enumerate() {
+                if !spared[k] {
+                    continue;
+                }
+                let (a, b) = clip(page);
+                if !crate::knownwrites::safety_due((b - a) as u64) {
+                    continue;
+                }
+                let mut title = vec![0u8; b - a];
+                if !crate::host::read_into(a as *const u8, &mut title) {
+                    continue;
+                }
+                // SAFETY: inside the copy's CPU side (the page lies in the
+                // refreshed range, inside the buffer); read only.
+                let held = unsafe { std::slice::from_raw_parts(self.data.add(a - start).cast_const(), b - a) };
+                if held != &title[..] {
+                    crate::knownwrites::stale(self.id, kind, self.start, self.len, page, (b - a) as u64);
+                    spared[k] = false;
+                    stale.push((a, b));
+                }
+            }
+        }
+        // Runs of pages to ask about: (first index, last index), spared gaps of up to `gap` pages joined.
+        let runs = ask_runs(&spared, gap);
+        // Spared pages asked anyway, in a run.
+        count(F_GAP, runs.iter().map(|&(i, j)| spared[i..=j].iter().filter(|&&s| s).count() as u64).sum());
+        // Spared in the end: in no run.
+        let mut kept = vec![true; pages.len()];
+        for &(i, j) in &runs {
+            kept[i..=j].fill(false);
+        }
+        let spared_bytes: usize = kept.iter().zip(&pages).filter(|(s, _)| **s).map(|(_, &(p, _))| clip(p).1 - clip(p).0).sum();
+        count(F_PAGES, kept.iter().filter(|&&s| s).count() as u64);
+        count(F_BYTES, spared_bytes as u64);
+        if runs.is_empty() {
+            count(F_NO_ASK, 1);
+        }
+        let mut bytes = 0;
+        for &(a, b) in &stale {
+            bytes += self.copy(a, b);
+        }
+        for (i, j) in runs {
+            let (a, b) = (clip(pages[i].0).0, clip(pages[j].0).1);
+            count(F_ASKS, 1);
+            let asking = std::time::Instant::now();
+            let answer = crate::watch::writes(a, b, true);
+            count(F_ASK_NS, asking.elapsed().as_nanos() as u64);
+            match answer {
+                Some((now, written)) => {
+                    let guarded = crate::watch::guarded(a, b) || self.watched.load(Ordering::Relaxed) == GUARDED;
+                    self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
+                    let copied = self.copy_stale(a, b, now, &written);
+                    self.refresh_check(a, b);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use crate::copystat::{C, add};
+                        add(C::Checked, (b - a) as u64);
+                        add(C::Unchanged, (b - a).saturating_sub(copied) as u64);
+                    }
+                    bytes += copied;
+                }
+                None => {
+                    // Not watched (any more): this run whole, the next refresh the usual way.
+                    self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+                    crate::lockmeter::whole(a, b);
+                    bytes += self.copy(a, b);
+                }
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Checked, spared_bytes as u64);
+            add(C::Unchanged, spared_bytes as u64);
+        }
+        Some(bytes)
     }
 
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a
@@ -4150,6 +4398,9 @@ impl Shadow {
         let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
         // Pages taken before and written since: in the order of their runs.
         let mut again_at: Vec<(usize, u64)> = Vec::new();
+        // (Coder J, `VICTORY_KNOWN_WRITES`) Every page taken before, with the old tracking's answer.
+        let known_writes = crate::knownwrites::on();
+        let mut seen: Vec<(usize, u64, u64)> = Vec::new();
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -4161,6 +4412,9 @@ impl Shadow {
             };
             let at = &mut copied[page - base];
             let taken = (*at).max(ranged);
+            if known_writes && taken != 0 {
+                seen.push((page, taken, write));
+            }
             if taken == 0 || write > taken {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
@@ -4188,7 +4442,55 @@ impl Shadow {
         if let Some((first, known)) = run {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
         }
-        let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
+        let parts = crate::watch::parts_written(&again_at);
+        if crate::copystep::account_on() {
+            let first = runs.iter().filter(|r| !r.2).map(|r| (r.1 - r.0).div_ceil(PAGE) as u64).sum();
+            crate::copystep::found(&again_at, first);
+        }
+        if known_writes && !seen.is_empty() {
+            let seen: Vec<crate::knownwrites::Seen> = seen
+                .into_iter()
+                .map(|(page, taken, write)| {
+                    let parts = again_at.binary_search_by_key(&page, |a| a.0).map_or(0, |i| parts[i]);
+                    crate::knownwrites::Seen { page, taken, write, parts }
+                })
+                .collect();
+            // (Mapped windows too: every filter miss is to be classed.)
+            let start = self.start as usize;
+            let compare = |a: usize, b: usize| -> Option<bool> {
+                let mut title = vec![0u8; b - a];
+                if !crate::host::read_into(a as *const u8, &mut title) {
+                    return None;
+                }
+                // SAFETY: inside the copy's CPU side (the pages lie in the
+                // refreshed range, inside the buffer); read only, before the take.
+                let held = unsafe { std::slice::from_raw_parts(self.data.add(a - start).cast_const(), b - a) };
+                Some(held != &title[..])
+            };
+            let kind = crate::lockmeter::kind(self.window, self.mapped, self.card.is_some());
+            crate::knownwrites::verify(self.id, kind, self.start, self.len, from, to, &seen, &compare);
+        }
+        let runs = by_parts(runs, &again_at, &parts);
+        // (Coder H, F23, `VICTORY_LOCK_METER=1`) What the watch found written, classed.
+        if crate::lockmeter::on() {
+            let kind = crate::lockmeter::kind(self.window, self.mapped, self.card.is_some());
+            let check = crate::lockmeter::found(self.id, self.start, self.len, kind, &runs, &again_at);
+            // Whether those bytes really changed since the copy took them.
+            let start = self.start as usize;
+            for (a, b, class) in check {
+                if self.mapped {
+                    crate::lockmeter::not_compared((b - a) as u64);
+                    continue;
+                }
+                let mut title = vec![0u8; b - a];
+                if crate::host::read_into(a as *const u8, &mut title) {
+                    // SAFETY: inside the copy's CPU side (the runs lie in the
+                    // buffer); read only, before the take below.
+                    let held = unsafe { std::slice::from_raw_parts(self.data.add(a - start).cast_const(), b - a) };
+                    crate::lockmeter::compared(class, (b - a) as u64, crate::lockmeter::changed_bytes(held, &title));
+                }
+            }
+        }
         let bytes = self.take_all(runs);
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.
@@ -4705,6 +5007,24 @@ impl Shadow {
     }
 }
 
+/// (Coder J, `VICTORY_KNOWN_WRITES=1`) The runs of pages a filtered refresh
+/// asks about, as (first index, last index) into `spared`: every page not
+/// spared is in one; spared gaps of up to `gap` pages between two are asked
+/// with them (one ask instead of two).
+fn ask_runs(spared: &[bool], gap: usize) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (k, &s) in spared.iter().enumerate() {
+        if s {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(r) if k - r.1 <= gap + 1 => r.1 = k,
+            _ => runs.push((k, k)),
+        }
+    }
+    runs
+}
+
 /// For tests: copies with no host buffer behind them.
 #[cfg(test)]
 impl Shadow {
@@ -5216,6 +5536,14 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return find(address, len);
     }
     lookup(address, len, true)
+}
+
+/// (coder K, `VICTORY_PAGE_KINDS` touch sampling) Whether a copy of a title buffer, or a window, covers `at`.
+pub(crate) fn copy_over(at: u64) -> bool {
+    peek(at, 1).is_some() || {
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        loose.range(..=(at, u64::MAX)).rev().take(64).any(|(&(s, l), _)| s <= at && s + l > at)
+    }
 }
 
 /// The copy [`find`] gives for a range inside a title buffer, if it was made.
@@ -5816,6 +6144,32 @@ mod window_tests {
     /// A tail runs from the ask's page to the end of its 4 MiB cell, and an
     /// ask takes the longest tail there is that holds it.
     #[test]
+    fn covered_windows_are_found() {
+        // Cell 0: a whole cell, a window in it, a tail. Cell 1: two with one
+        // start; one reaching in from cell 1 into cell 2, a window in cell 2.
+        let keys = [
+            (0, 0x40_0000),
+            (0x10_0000, 0x10_0000),
+            (0x30_0000, 0x10_0000),
+            (0x40_0000, 0x10_0000),
+            (0x40_0000, 0x20_0000),
+            (0x70_0000, 0x20_0000),
+            (0x80_0000, 0x10_0000),
+        ];
+        let c = super::covered_windows(keys.into_iter());
+        assert!(c.contains(&(0x10_0000, 0x10_0000)));
+        assert!(c.contains(&(0x30_0000, 0x10_0000)), "a tail under a whole cell");
+        assert!(c.contains(&(0x40_0000, 0x10_0000)));
+        assert!(!c.contains(&(0, 0x40_0000)));
+        assert!(!c.contains(&(0x40_0000, 0x20_0000)));
+        assert!(!c.contains(&(0x70_0000, 0x20_0000)));
+        assert!(!c.contains(&(0x80_0000, 0x10_0000)), "a cover from the cell below is not taken");
+        // A tail under a window that does not end at the cell's end stays.
+        let c = super::covered_windows([(0, 0x50_0000), (0x30_0000, 0x10_0000)].into_iter());
+        assert!(!c.contains(&(0x30_0000, 0x10_0000)));
+    }
+
+    #[test]
     fn tails_run_to_the_cells_end_and_the_longest_is_taken() {
         let cell = 0xd_1200_0000u64;
         let ask = cell + 0x12_3456;
@@ -5909,4 +6263,120 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// (Coder J, `VICTORY_KNOWN_WRITES=1`) The filter engaged on a copy of
+/// write-watched memory.
+#[cfg(test)]
+mod known_writes_tests {
+    use super::{PAGE, Shadow, ask_runs};
+    use crate::knownwrites::test_hooks as hooks;
+    use std::sync::Arc;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+
+    const PAGES: usize = 8;
+    const LEN: usize = PAGES * PAGE;
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// The mode `=1` for the test, the safety compare off; off again after.
+    struct On(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+    impl On {
+        fn new() -> On {
+            let l = hooks::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            hooks::set_mode(2);
+            hooks::stand_aside(false);
+            hooks::no_safety_compare();
+            On(l)
+        }
+    }
+    impl Drop for On {
+        fn drop(&mut self) {
+            hooks::stand_aside(false);
+            hooks::set_mode(0);
+        }
+    }
+
+    /// A copy of fresh write-watched title memory (never given back), taken
+    /// once, its pages then event-covered with no mark.
+    fn taken() -> (Arc<Shadow>, usize, *mut u8) {
+        // SAFETY: plain allocations.
+        let (region, data) = unsafe {
+            (
+                VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize,
+                VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>(),
+            )
+        };
+        assert!(region != 0 && !data.is_null());
+        // SAFETY: the test's own memory.
+        unsafe { std::ptr::write_bytes(region as *mut u8, 1, LEN) };
+        let copy = Shadow::unbacked(region as u64, data, LEN as u64, false);
+        assert_eq!(copy.update(region, LEN), LEN, "never taken: all of it");
+        hooks::cover(region, LEN);
+        (copy, region, data)
+    }
+
+    fn write(region: usize, page: usize, value: u8) {
+        // SAFETY: the test's own memory.
+        unsafe { ((region + page * PAGE + 8) as *mut u8).write_volatile(value) };
+    }
+
+    fn held(data: *mut u8, page: usize) -> u8 {
+        // SAFETY: the copy's own bytes.
+        unsafe { data.add(page * PAGE + 8).read_volatile() }
+    }
+
+    /// Event-covered pages with no mark get no ask (a write there with no
+    /// event is not taken: the filter's trust); a marked page is asked and
+    /// its write taken.
+    #[test]
+    fn covered_clean_pages_get_no_ask_and_marked_ones_do() {
+        let _on = On::new();
+        let (copy, region, data) = taken();
+        write(region, 3, 7);
+        write(region, 6, 9);
+        crate::knownwrites::note(crate::knownwrites::SRC_OUR_COPY, region + 6 * PAGE, 16);
+        let (asks, pages) = (hooks::f_count(crate::knownwrites::F_ASKS), hooks::f_count(crate::knownwrites::F_PAGES));
+        assert!(copy.update(region, LEN) > 0);
+        assert_eq!(held(data, 6), 9, "the marked page was asked and taken");
+        assert_eq!(held(data, 3), 1, "the unmarked event-covered page was not asked");
+        assert_eq!(hooks::f_count(crate::knownwrites::F_ASKS) - asks, 1, "one ask: the marked page's run");
+        assert_eq!(hooks::f_count(crate::knownwrites::F_PAGES) - pages, (PAGES - 1) as u64);
+    }
+
+    /// A landing in flight keeps its pages asked until its bytes are in.
+    #[test]
+    fn a_landing_in_flight_keeps_its_pages_asked() {
+        let _on = On::new();
+        let (copy, region, data) = taken();
+        crate::knownwrites::landing(region + 2 * PAGE, PAGE);
+        write(region, 2, 5);
+        assert!(copy.update(region, LEN) > 0);
+        assert_eq!(held(data, 2), 5, "in flight: asked");
+        crate::knownwrites::landed(region + 2 * PAGE, PAGE);
+    }
+
+    /// Standing aside (cost limit), today's tracking takes the refresh: a
+    /// write on an unmarked event-covered page is found and taken.
+    #[test]
+    fn standing_aside_falls_back_to_the_old_tracking() {
+        let _on = On::new();
+        let (copy, region, data) = taken();
+        hooks::stand_aside(true);
+        let aside = hooks::not_count(crate::knownwrites::NOT_ASIDE);
+        write(region, 4, 3);
+        assert!(copy.update(region, LEN) > 0);
+        assert_eq!(held(data, 4), 3, "asked the usual way");
+        assert_eq!(hooks::not_count(crate::knownwrites::NOT_ASIDE), aside + 1);
+    }
+
+    /// Runs to ask: every page not spared in one, spared gaps up to `gap` joined.
+    #[test]
+    fn ask_runs_join_short_gaps() {
+        let s = |v: &str| v.bytes().map(|b| b == b'.').collect::<Vec<bool>>();
+        assert_eq!(ask_runs(&s("........"), 8), []);
+        assert_eq!(ask_runs(&s("x..x...."), 2), [(0, 3)]);
+        assert_eq!(ask_runs(&s("x...x..x"), 2), [(0, 0), (4, 7)]);
+        assert_eq!(ask_runs(&s("xx"), 0), [(0, 1)]);
+        assert_eq!(ask_runs(&s("x.x"), 0), [(0, 0), (2, 2)]);
+    }
 }

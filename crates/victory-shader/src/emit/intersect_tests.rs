@@ -701,3 +701,39 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         other => panic!("{:?}", other.map(|_| ())),
     }
 }
+
+/// (Fox T, `VICTORY_BVH_PAGE_REUSE=1`) The second half of a 128-byte box node read through
+/// the first half's directory entry where both lie in one page: the same results on the
+/// card, and through the host's directory the program still lowers and validates.
+#[test]
+fn the_second_half_of_a_box_node_in_the_same_page_gives_the_same_results() {
+    let was = crate::emit::TEST_BVH_PAGE_REUSE.replace(Some(true));
+    {
+        let _memory = Memory::at(BASE);
+        run(true, WHOLE, BASE + u64::from(NODES), true);
+    }
+    {
+        let base = 0x312_3456_7800u64;
+        let structure = base + u64::from(NODES);
+        let _memory = Memory::at(base);
+        let descriptor = Descriptor::Numbers((structure >> 8) as u32, (structure >> 40) as u32 | bvh::BOX_SORT);
+        run(false, descriptor, 0, true);
+    }
+    for wide in [true, false] {
+        let (shader, _) = build(wide, WHOLE).expect("lowers through the directory");
+        assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
+    }
+    crate::emit::TEST_BVH_PAGE_REUSE.set(was);
+}
+
+/// (Fox T) With `VICTORY_BVH_PAGE_REUSE` off the translation is the one before the switch:
+/// the same module whether the switch is unset or set to off.
+#[test]
+fn page_reuse_off_translates_as_before() {
+    let was = crate::emit::TEST_BVH_PAGE_REUSE.replace(Some(false));
+    let off = build(true, WHOLE).expect("lowers").0.dxil;
+    crate::emit::TEST_BVH_PAGE_REUSE.set(Some(true));
+    let on = build(true, WHOLE).expect("lowers").0.dxil;
+    crate::emit::TEST_BVH_PAGE_REUSE.set(was);
+    assert_ne!(off, on, "the switch changes nothing");
+}

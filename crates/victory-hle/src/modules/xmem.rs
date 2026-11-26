@@ -242,6 +242,10 @@ pub extern "system" fn XMemVirtualQuery(
         };
         info.tag_code = 0;
         info.tag = [0; 4];
+        // (coder G) The load-read meter's guard bit is not the title's.
+        if victory_gpu::loadmeter::on() {
+            info.host.Protect &= !0x100;
+        }
     }
     1
 }
@@ -563,6 +567,7 @@ fn shown_mut() -> RwLockWriteGuard<'static, Shown> {
 impl Shown {
     fn note(&mut self, base: usize, len: usize, slice: &Slice) {
         let section = Arc::as_ptr(&slice.section) as usize;
+        super::pagekinds::shown(base, len, section, slice.index);
         if len / PAGE > SHORT {
             self.long.push((base, len, section, slice.index));
             return;
@@ -573,6 +578,7 @@ impl Shown {
     }
 
     fn forget(&mut self, base: usize, len: usize, slice: &Slice) {
+        super::pagekinds::unshown(base, len);
         if len / PAGE > SHORT {
             self.long.retain(|view| view.0 != base);
             return;
@@ -809,6 +815,80 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
         }
     }
     Some(runs)
+}
+
+/// (coder G, `VICTORY_PAGE_KINDS`) The pool pages (section, index) under bytes `[offset, offset + len)` of
+/// `pages` and the bytes of each; unknown pages left out.
+pub(crate) fn page_keys(pages: &[usize], offset: usize, len: usize) -> Vec<((usize, usize), usize)> {
+    let end = offset.saturating_add(len);
+    let first = offset / PAGE;
+    let Some(numbers) = pages.get(first..end.div_ceil(PAGE)) else {
+        return Vec::new();
+    };
+    let table = page_table();
+    numbers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| {
+            let slice = table.pages.get(n)?;
+            let lo = if i == 0 { offset % PAGE } else { 0 };
+            let hi = (end - (first + i) * PAGE).min(PAGE);
+            Some(((Arc::as_ptr(&slice.section) as usize, slice.index), hi - lo))
+        })
+        .collect()
+}
+
+/// (coder G, `VICTORY_PAGE_KINDS`) Our whole-section views (the linear view DirectStorage writes through):
+/// address and bytes of each section that has one.
+/// (coder K, `VICTORY_GPU_ONLY=1` refusal log) Which view of ours holds `at`: a title mapping (our record of
+/// the title's views), our own section window, or neither, with what Windows says of it.
+pub(crate) fn describe(at: usize) -> String {
+    let title = {
+        let p = physical();
+        p.views
+            .range(..=at)
+            .next_back()
+            .filter(|(b, v)| at < *b + v.0)
+            .map(|(b, v)| format!("title view {b:#x}+{:#x} (section {:#x} page {})", v.0, v.1.section.handle as usize, v.1.index))
+    };
+    let window = section_windows().into_iter().find(|&(a, n)| (a..a + n).contains(&at)).map(|(a, n)| format!("our section window {a:#x}+{n:#x}"));
+    let query = {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: plain data the query fills in.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            "no region".to_string()
+        } else {
+            format!("allocation {:#x} type {:#x} state {:#x} protect {:#x}", info.AllocationBase as usize, info.Type, info.State, info.Protect)
+        }
+    };
+    format!("{}; {}; {query}", title.unwrap_or_else(|| "no title view".into()), window.unwrap_or_else(|| "no window of ours".into()))
+}
+
+/// (coder K, `VICTORY_GPU_ONLY=1`) The title's linear views of its pool: one view of a whole section from its
+/// first page (run-144: 0xe1c800000 + 6,236 MB, every pool page): address, bytes, section handle.
+pub(crate) fn linear_views() -> Vec<(usize, usize, usize)> {
+    let p = physical();
+    p.views
+        .iter()
+        .filter(|(_, (len, slice))| slice.index == 0 && *len == slice.section.pages * PAGE && *len >= 64 << 20)
+        .map(|(&b, (len, slice))| (b, *len, slice.section.handle as usize))
+        .collect()
+}
+
+pub(crate) fn section_windows() -> Vec<(usize, usize)> {
+    let table = page_table();
+    let mut seen = std::collections::BTreeMap::new();
+    for slice in table.pages.values() {
+        if let Some(&w) = slice.section.window.get()
+            && w != 0
+        {
+            seen.insert(w, slice.section.pages * PAGE);
+        }
+    }
+    seen.into_iter().collect()
 }
 
 /// Whether the title owns every page under bytes `[offset, offset + len)`.
@@ -1454,6 +1534,10 @@ fn scatter_now(addresses: *const *mut c_void, n: usize, pages: *const usize) -> 
 /// the title maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
+    if from != 0 {
+        victory_gpu::loadmeter::gpu_view(to as usize, len as usize);
+        super::pagekinds::gpu_view(to as usize, len as usize);
+    }
     // (F10, `VICTORY_MAP_DEFER`) An unmapping (always a success here)
     // deferred; a map applies the pending unmappings of both its ranges first.
     if from == 0 && super::mapdefer::on() {
@@ -1491,6 +1575,14 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 
 /// [`map_alias`] of many ranges, in order.
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
+    if victory_gpu::loadmeter::on() || super::pagekinds::on() {
+        for &(to, from, len) in ranges {
+            if from != 0 {
+                victory_gpu::loadmeter::gpu_view(to as usize, len as usize);
+                super::pagekinds::gpu_view(to as usize, len as usize);
+            }
+        }
+    }
     if super::mapdefer::on() {
         lift_thread();
         // (F10, `VICTORY_MAP_DEFER`) Unmappings deferred in order; the maps
