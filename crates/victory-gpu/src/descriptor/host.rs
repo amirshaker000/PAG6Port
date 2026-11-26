@@ -3672,10 +3672,29 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_view_range(base, element, buffer.FirstElement, buffer.NumElements)
+}
+
+/// (lc22 414d469e) The bytes `count` elements of `element` bytes from
+/// element `first` on take, as an offset and a length; `None` for an
+/// empty view or one whose bytes overflow.
+fn buffer_view_range(element: u64, first: u64, count: u32) -> Option<(u64, u64)> {
+    if element == 0 || count == 0 {
+        return None;
+    }
+    let offset = first.checked_mul(element)?;
+    let bytes = u64::from(count).checked_mul(element)?;
+    offset.checked_add(bytes)?;
+    Some((offset, bytes))
+}
+
+/// [`buffer_view_range`] from address `base`: the view's start and length,
+/// `None` where they overflow.
+fn checked_view_range(base: u64, element: u64, first: u64, count: u32) -> Option<(u64, u64)> {
+    let (offset, bytes) = buffer_view_range(element, first, count)?;
+    let start = base.checked_add(offset)?;
+    start.checked_add(bytes)?;
+    Some((start, bytes))
 }
 
 /// The address a shader finds in a descriptor of title memory: where a
@@ -3759,10 +3778,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_view_range(base, element, buffer.FirstElement, buffer.NumElements)
 }
 
 /// The host resource a slot made by [`make`] views, if any.
@@ -3902,9 +3918,13 @@ fn buffer_srv(
     let unit = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let own = unsafe { &mut desc.Anonymous.Buffer };
-    let start = address + own.FirstElement * unit;
+    // (lc22 414d469e) An empty view, or one whose bytes overflow, is none.
+    let Some((start, bytes)) = checked_view_range(address, unit, own.FirstElement, own.NumElements) else {
+        once!(len, "empty or overflowing buffer view");
+        return None;
+    };
     let kind = (own.StructureByteStride, own.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, desc.Format.0 as u32);
-    let home = view_home(shadow.clone(), start, u64::from(own.NumElements) * unit, kind);
+    let home = view_home(shadow.clone(), start, bytes, kind);
     if !std::sync::Arc::ptr_eq(&home, &shadow) {
         // Its own bytes: it begins where they do.
         (shadow, offset) = (home, 0);
@@ -4018,9 +4038,13 @@ fn buffer_uav(
     };
     // SAFETY: a buffer view's union member.
     let own = unsafe { &mut desc.Anonymous.Buffer };
-    let start = address + own.FirstElement * unit;
+    // (lc22 414d469e) An empty view, or one whose bytes overflow, is none.
+    let Some((start, bytes)) = checked_view_range(address, unit, own.FirstElement, own.NumElements) else {
+        once!(len, "empty or overflowing unordered buffer view");
+        return None;
+    };
     let kind = (own.StructureByteStride, own.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, desc.Format.0 as u32);
-    let home = view_home(shadow.clone(), start, u64::from(own.NumElements) * unit, kind);
+    let home = view_home(shadow.clone(), start, bytes, kind);
     let mut address = address;
     if !std::sync::Arc::ptr_eq(&home, &shadow) {
         // Its own bytes: it begins where they do.
@@ -5047,6 +5071,20 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (lc22 414d469e) Buffer view ranges are checked before a view is made:
+    /// empty views, views of elements without a size and views whose bytes
+    /// overflow are none.
+    #[test]
+    fn buffer_view_ranges_are_validated_before_creation() {
+        assert_eq!(buffer_view_range(4, 3, 2), Some((12, 8)));
+        assert_eq!(buffer_view_range(4, 0, 0), None);
+        assert_eq!(buffer_view_range(0, 0, 4), None);
+        assert_eq!(buffer_view_range(4, u64::MAX, 2), None);
+        assert_eq!(buffer_view_range(u64::MAX, 2, 2), None);
+        assert_eq!(checked_view_range(0x1000, 4, 3, 2), Some((0x100c, 8)));
+        assert_eq!(checked_view_range(u64::MAX - 4, 4, 1, 1), None);
+    }
 
     /// (fxceless #927) The unsigned twin of a 16-bit float or signed format has its layout,
     /// and only buffer views in such a format are shown as another view.
