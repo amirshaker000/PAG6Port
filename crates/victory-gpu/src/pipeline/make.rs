@@ -22,6 +22,7 @@
 //! 18e57db8 found the same).
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -204,10 +205,29 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
+        self.make_with(|| {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            made
+        });
+    }
+
+    /// (fxceless #1353) Completes this queue entry with what `build` makes,
+    /// and wakes its waiters. A build that panics (translator or driver
+    /// wrapper) completes it too, without a host pipeline: the panic is
+    /// caught inside the initialisation, so the entry is final on whichever
+    /// thread made it (a worker, or a title thread through [`now`] or with
+    /// no workers), never left "being made" nor taken down with that thread.
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
+        self.made.get_or_init(|| {
+            let made = match catch_unwind(AssertUnwindSafe(build)) {
+                Ok(made) => made,
+                Err(_) => {
+                    tracing::error!(shaders = ?self.shaders, "a host pipeline's creation panicked: it goes without one");
+                    None
+                }
+            };
             // (Fox P) A creation that fails is final: `made` holds `None`
             // (the reason was logged by `HostPipeline::new`), never "being made".
             if made.is_none() {
@@ -657,19 +677,10 @@ fn workers() -> bool {
                     loop {
                         let p = next(screens_only);
                         BUSY.fetch_add(1, Ordering::Relaxed);
-                        // (Fox P) A creation that panics (translator or
-                        // driver wrapper) would end this worker and leave the
-                        // pipeline "being made" for good: it is made final
-                        // without a host pipeline instead, and said once.
-                        let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.make()));
-                        if made.is_err() {
-                            FAILED.fetch_add(1, Ordering::Relaxed);
-                            tracing::error!(shaders = ?p.shaders, "a host pipeline's creation panicked: it goes without one");
-                            let _ = p.made.set(None);
-                            let (lock, done) = &DONE;
-                            let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-                            done.notify_all();
-                        }
+                        // (Fox P, fxceless #1353) A creation that panics is
+                        // made final without a host pipeline inside `make`,
+                        // so this worker goes on to the next.
+                        p.make();
                         BUSY.fetch_sub(1, Ordering::Relaxed);
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
@@ -913,6 +924,24 @@ mod tests {
             Some("billboard_nobump:CS_RaytracingResolve_a56bfb9c")
         );
         assert_eq!(program_name(b"nothing here"), None);
+    }
+
+    #[test]
+    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
+        let bad = Arc::new(Pending::new(Vec::new(), None));
+        let good = Arc::new(Pending::new(Vec::new(), None));
+        let failed = bad.clone();
+        let next = good.clone();
+        let worker = std::thread::spawn(move || {
+            failed.make_with(|| panic!("synthetic pipeline build panic"));
+            next.make_with(|| None);
+        });
+
+        worker.join().expect("the pipeline worker should survive");
+        assert!(matches!(bad.made.get(), Some(None)));
+        assert!(matches!(good.made.get(), Some(None)));
+
+        bad.make_with(|| panic!("the refused pipeline should stay complete"));
     }
 
     #[test]
