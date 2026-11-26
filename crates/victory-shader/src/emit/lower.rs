@@ -157,14 +157,36 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 /// all lanes) the lanes past the count stay and are left out of memory, EXEC's
 /// ballots and the wave's reductions instead (`Lower::partial_active`).
 fn counted_in_threads(parts: &Parts) -> bool {
-    let crate::native::StageIo::Cs(cs) = &parts.native.io else {
+    counted_in_threads_of(parts.native, parts.p)
+}
+
+/// [`counted_in_threads`] of `native`, built as `p`.
+fn counted_in_threads_of(native: &NativeProgram, p: &Program) -> bool {
+    let crate::native::StageIo::Cs(cs) = &native.io else {
         return false;
     };
     cs.threads[0] > 1
         && cs.threads[1..] == [1, 1]
-        && crate::spill::is_spilled(parts.native)
-        && (!parts.native.wave64 || host_max_wave() >= 64 || counted_halves())
-        && !parts.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier")
+        && crate::spill::is_spilled(native)
+        && (!native.wave64 || host_max_wave() >= 64 || counted_halves())
+        && !p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier")
+}
+
+/// (kyles98 4e825fbf) Whether a program's lanes start in EXEC only below the dispatch's
+/// thread count (`structure::set_entry_limited`; `VICTORY_THREAD_LIMIT=0`: every lane, as
+/// before): the compute programs with a spilled user-data table (the console's ray-tracing
+/// structure builder, whose in-place stages are dispatched by thread counts) whose lanes past
+/// the count are not already left out at entry ([`counted_in_threads`]): a console wave64
+/// program in two host waves of 32 (without `VICTORY_BVH_COUNT32=1`), one with a group
+/// barrier, or one with groups along y or z. A lane past the count is in the wave and
+/// outside EXEC, so a count of EXEC's lanes leaves it out, its stores do not happen, and a
+/// program that widens EXEC runs it as the console does.
+pub(super) fn thread_limited(native: &NativeProgram, p: &Program) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_LIMIT").is_none_or(|v| v != "0"))
+        && native.stage == HwStage::Cs
+        && crate::spill::is_spilled(native)
+        && !counted_in_threads_of(native, p)
 }
 
 /// (Fox T, upstream 06fe22a / PR #66) `VICTORY_BVH_COUNT32=1`: a wave64 program of the
@@ -2552,6 +2574,33 @@ impl<'a> Lower<'a> {
             let r = self.inputs();
             self.swap_lanes();
             r?;
+        }
+        if crate::structure::entry_limited()
+            && let StageIo::Cs(cs) = &self.x.native.io
+            && let Some(&(_, lo)) = p.inputs.iter().find(|i| i.0 == Reg::S(EXEC))
+        {
+            // EXEC on entry, a lane's own bit: its thread along x is below the count the
+            // dispatch runs (`shader.rs` `USER_DISPATCH_THREADS_X`, 0: every thread).
+            if self.twin.is_some() {
+                return Err(unsupported(0, "a dispatch's thread count in the paired form"));
+            }
+            let e = self.s.entry;
+            let width = cs.threads[0];
+            let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+                unreachable!()
+            };
+            let Val::I32(thread) = self.thread_id(0) else {
+                return Err(unsupported(0, "a thread id for the dispatch's thread count"));
+            };
+            let size = self.s.m.i32(width);
+            let first = self.s.m.bin(e, Bin::Mul, group, size);
+            let at = self.s.m.bin(e, Bin::Add, first, thread);
+            let limit = self.host_word(RootType::Other(super::shader::USER_DISPATCH_THREADS_X), 0, width);
+            let zero = self.s.m.i32(0);
+            let all = self.s.m.cmp(e, pred::EQ, limit, zero);
+            let inside = self.s.m.cmp(e, pred::IULT, at, limit);
+            let bit = self.s.m.bin(e, Bin::Or, all, inside);
+            self.lane_bits.insert(lo, bit);
         }
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
