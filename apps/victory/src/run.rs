@@ -183,21 +183,13 @@ pub fn run(
                 let done = unsafe { apply(image.base(), size, rate, &SITES) };
                 let patched = done.iter().filter(|d| **d == Patched::Done).count();
                 println!(
-                    "frame rate: our clock {ms} ms; the title's rate {rate} ({patched} of {} reads of its setting patched; it asks for {} us at 60 Hz)",
+                    "frame rate: our clock {ms} ms; the title's rate {rate} ({patched} of {} loads of its setting patched; it asks for {} us at 60 Hz)",
                     SITES.len(),
                     title_interval_us(rate, false)
                 );
             }
             None => println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is"),
         }
-    }
-    // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
-    // VICTORY_UPSCALER; each off without it).
-    #[cfg(windows)]
-    if execute {
-        let size = image.info().size_of_image as usize;
-        // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
