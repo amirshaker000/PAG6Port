@@ -419,12 +419,21 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// for 87 MB in run 102), and each had a pass of its own over its pieces,
 /// so a piece that held several ranges was hashed once for each.
 pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
+    joined_piece_runs_within(runs, 0)
+}
+
+/// The same, joining runs whose pieces are within `max_gap` of each other
+/// (ad3lre b6552d5e, `VICTORY_CARD_REHASH_GAP`): ranges sent up lie close
+/// together, and a short gap cost a pass of its own over nearly the same
+/// pieces.
+pub(crate) fn joined_piece_runs_within(mut runs: Vec<CardSpan>, max_gap: u32) -> Vec<CardSpan> {
     runs.sort_unstable_by_key(|r| r.first);
     let mut out: Vec<CardSpan> = Vec::with_capacity(runs.len());
     for run in runs {
         match out.last_mut() {
-            Some(last) if run.first <= last.first + last.pieces => {
-                last.pieces = last.pieces.max(run.first + run.pieces - last.first);
+            Some(last) if run.first <= last.first + last.pieces + max_gap => {
+                let end = (last.first + last.pieces).max(run.first + run.pieces);
+                last.pieces = end - last.first;
                 last.to = last.to.max(run.to);
             }
             _ => out.push(run),

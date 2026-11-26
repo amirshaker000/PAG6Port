@@ -445,12 +445,11 @@ fn library() -> Option<&'static Library> {
         .get_or_init(|| {
             // library is not for it, and what it would save is not for
             // the card. Neither read nor written in such a run.
-            let device = if cfg!(feature = "diagnostics") {
-                crate::host::host()?.device.cast::<ID3D12Device1>().ok()?
-            } else {
-                // `open` only uses it for diagnostics counting.
-                unsafe { std::mem::zeroed() }
-            };
+            // A real device in every case: a zeroed interface handle is UB,
+            // and `open` calls through it (a diagnostics build took the
+            // first branch; a plain one zeroed it and panics at the first
+            // use - the geometry test).
+            let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
             if library.is_none() {

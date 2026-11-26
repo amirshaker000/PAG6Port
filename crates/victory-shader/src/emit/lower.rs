@@ -3874,7 +3874,7 @@ impl<'a> Lower<'a> {
                         if !self.local_ok && !self.local_any {
                             return Err("a lane mask read as data in a half-wave");
                         }
-                    } else if !self.exchange.as_ref().is_some_and(|e| e.1) && !b.is_none_or(|b| self.all_lanes(b)) {
+                    } else if !self.exchange.as_ref().is_some_and(|e| e.1) && !b.is_none_or(|b| self.all_lanes(b)) && !Self::exact_waves() {
                         // (a group of 32 or fewer has no other half to exchange with)
                         need(b.unwrap_or(0));
                         return Err("a lane mask exchanged where not every lane runs");
@@ -4638,7 +4638,7 @@ impl<'a> Lower<'a> {
         if local_any || !self.exchange.as_ref().is_some_and(|e| !e.1) {
             return Ok(some);
         }
-        if !made.is_none_or(|b| self.all_lanes(b)) {
+        if !made.is_none_or(|b| self.all_lanes(b)) && !Self::exact_waves() {
             need(made.unwrap_or(0));
             return Err("a lane mask exchanged where not every lane runs");
         }
@@ -5259,6 +5259,21 @@ impl<'a> Lower<'a> {
     /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
     /// lane: the console reads the first lane of EXEC, and a lane that got here with EXEC clear
     /// (a guard, not a branch) is not one. With none, `x` of the wave's first lane here.
+    /// Whether an exchange between the two host waves of a console wave is
+    /// allowed under divergence (VICTORY_EXACT_WAVES=1, or its older name
+    /// VICTORY_EXACT_FIRSTLANE=1): the structure builder's scans and votes
+    /// reach the exchange together (their loop exits are per console wave);
+    /// elsewhere the group barrier inside can wait for a half that never
+    /// arrives.
+    fn exact_waves() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            ["VICTORY_EXACT_WAVES", "VICTORY_EXACT_FIRSTLANE"]
+                .iter()
+                .any(|k| std::env::var_os(k).is_some_and(|v| v == "1"))
+        })
+    }
+
     fn first_lane(&mut self, x: V, guard: Option<V>) -> (V, V) {
         let c = self.cur;
         let i32t = self.s.t.i32;
