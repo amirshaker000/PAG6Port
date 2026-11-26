@@ -3950,6 +3950,7 @@ mod record_print_tests {
 #[cfg(test)]
 mod own_copy_tests {
     use super::own_bytes_if;
+    use super::HostHeap;
 
     /// A buffer view gets a copy of its own bytes only when it has no host
     /// view on its buffer's copy: off that copy's elements, and not a
@@ -3986,7 +3987,7 @@ mod own_copy_tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        let spare = heap.spare;
+        let spare = heap.count + heap.dynamic;
         // [0, 50) and [50, spare - 10): the search goes on at spare - 10,
         // and the last 10 slots were never taken.
         let a = heap.dynamic(50).unwrap();
