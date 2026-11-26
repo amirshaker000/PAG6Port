@@ -164,10 +164,9 @@ pub(crate) fn apply(pad: &mut super::gameinput::PadState) {
     unsafe { SetCursorPos(c.x, c.y) };
     TOTAL_X.fetch_add(i64::from(dx), Ordering::Relaxed);
     TOTAL_Y.fetch_add(i64::from(dy), Ordering::Relaxed);
-    if device() {
-        // The device reports the motion and buttons; the stick stays the pad's.
-        return;
-    }
+    // The title turns its camera from the pad's right stick only (the GameInput
+    // mouse device connects but its motion is not read for the camera), so the
+    // stick is fed in device mode too.
     // The stick is held between samples: the pad's polls within one frame
     // must all see the same deflection, not a re-decayed one.
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
