@@ -1291,14 +1291,38 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
 }
 
-/// Device method.
-pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        #[cfg(windows)]
-        crate::loadmeter::view(address, u64::from(size), crate::loadmeter::ViewKind::Constant);
-        record(handle, View::Constant(address, size));
+/// (lc22 414d469e) The largest constant buffer view the host has:
+/// 4096 16-byte elements (D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT).
+pub(crate) const MAX_CBV_BYTES: u32 = 4096 * 16;
+
+/// (lc22 414d469e) The view a constant buffer description names: capped at
+/// [`MAX_CBV_BYTES`]; a null or zero-size one is the zero view
+/// (`Constant(0, 0)`, a null view on the host).
+fn cbv_view(desc: Option<[u32; 4]>) -> View {
+    match desc {
+        Some([lo, hi, size, _]) if size != 0 => {
+            let address = u64::from(lo) | u64::from(hi) << 32;
+            View::Constant(address, size.min(MAX_CBV_BYTES))
+        }
+        _ => View::Constant(0, 0),
     }
+}
+
+/// Device method.
+///
+/// A null or zero-size `desc` writes the zero view (`Constant(0, 0)`), as
+/// D3D12's `CreateConstantBufferView` with a null description makes a null
+/// view: leaving the slot untouched would keep a stale view active, and a
+/// zero-size view would read nothing the host can make.
+pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
+    let view = cbv_view(words(desc));
+    #[cfg(windows)]
+    if let View::Constant(address, size) = view
+        && size != 0
+    {
+        crate::loadmeter::view(address, u64::from(size), crate::loadmeter::ViewKind::Constant);
+    }
+    record(handle, view);
 }
 
 /// Device method.
@@ -1670,6 +1694,24 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    /// (lc22 414d469e) Constant views larger than the host has are capped;
+    /// zero-size and null ones are the zero view.
+    #[test]
+    fn cbv_sizes_are_capped_and_zero_sizes_use_the_zero_view() {
+        let null = std::ptr::null();
+        let slots = vec![0u64; 4 * 4];
+        let at = |i: usize| slots.as_ptr() as u64 + 32 * i as u64;
+        let (a, b, c, d) = (at(0), at(1), at(2), at(3));
+        create_cbv(null, &[0x1000, 1, 70_000, 0], a);
+        assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, MAX_CBV_BYTES)));
+        create_cbv(null, &[0x1000, 1, MAX_CBV_BYTES, 0], b);
+        assert_eq!(view(b), Some(View::Constant(0x1_0000_1000, MAX_CBV_BYTES)));
+        create_cbv(null, &[0x1000, 1, 0, 0], c);
+        assert_eq!(view(c), Some(View::Constant(0, 0)));
+        create_cbv(null, std::ptr::null(), d);
+        assert_eq!(view(d), Some(View::Constant(0, 0)));
     }
 
     #[test]
