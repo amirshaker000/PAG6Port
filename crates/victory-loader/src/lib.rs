@@ -25,6 +25,8 @@
 mod stubs;
 mod hooks;
 mod crash;
+#[cfg(windows)]
+pub mod frame_rate;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;
