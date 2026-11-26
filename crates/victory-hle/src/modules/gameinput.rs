@@ -83,14 +83,14 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct PadState {
-    buttons: u32,
-    left_trigger: f32,
-    right_trigger: f32,
-    left_x: f32,
-    left_y: f32,
-    right_x: f32,
-    right_y: f32,
+pub(crate) struct PadState {
+    pub(crate) buttons: u32,
+    pub(crate) left_trigger: f32,
+    pub(crate) right_trigger: f32,
+    pub(crate) left_x: f32,
+    pub(crate) left_y: f32,
+    pub(crate) right_x: f32,
+    pub(crate) right_y: f32,
 }
 
 /// One key held down: scan code (0xE0xx when extended), character, key.
@@ -484,6 +484,30 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        // The mouse as the right stick rides the first real pad, or the
+        // stand-in pad when none is connected (VICTORY_MOUSE=1).
+        if super::mouse::enabled() {
+            let mut pads = pads;
+            if let Some(pad) = pads.iter_mut().find_map(|p| p.as_mut()) {
+                super::mouse::apply(pad);
+                if one_pad {
+                    let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+                    self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
+                    self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
+                    return events;
+                }
+                for (slot, pad) in pads.into_iter().enumerate() {
+                    self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
+                }
+                self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
+                return events;
+            }
+            let mut pad = fallback(&keys);
+            super::mouse::apply(&mut pad);
+            self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
+            self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
+            return events;
+        }
         if one_pad {
             let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
