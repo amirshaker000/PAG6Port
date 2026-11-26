@@ -98,7 +98,9 @@ fn program_name(container: &[u8]) -> Option<&str> {
             && w[1].is_ascii_uppercase()
             && w[2] == b'_'
             && (i == 0 || !ident(container[i - 1]));
-        if starts {
+        // (Not a system value's semantic, `SV_Position`: a mesh or pixel
+        // container names those before its program.)
+        if starts && !w.starts_with(b"SV_") {
             let len = w.iter().take_while(|&&b| ident(b)).count();
             if len >= 6 {
                 return std::str::from_utf8(&w[..len]).ok();

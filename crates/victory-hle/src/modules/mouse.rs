@@ -19,13 +19,17 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-pub(super) const FULL_SPEED: f32 = 4000.0;
+pub(super) const FULL_SPEED: f32 = 1800.0;
 /// Slower than this (counts a second) the stick rests: sensor noise.
-const REST_SPEED: f32 = 20.0;
+const REST_SPEED: f32 = 8.0;
 /// Deflection the slowest movement starts at (past the inner dead zone).
-const START: f32 = 0.15;
+const START: f32 = 0.3;
 /// Time constant of the speed's smoothing (s): the mouse reports in bursts.
-const SMOOTHING: f32 = 0.03;
+const SMOOTHING: f32 = 0.012;
+/// The velocity is sampled at most this often (ms): the pad is polled many
+/// times a frame, and each poll sees the cursor already back at the centre -
+/// sampling every poll would decay the stick to rest within one frame.
+const SAMPLE_MIN_MS: u64 = 8;
 
 /// The deflection for a mouse velocity (counts a second, screen axes).
 pub(super) fn stick_from_mouse(vx: f32, vy: f32) -> (f32, f32) {
@@ -43,11 +47,17 @@ pub(super) fn stick_from_mouse(vx: f32, vy: f32) -> (f32, f32) {
 pub(super) struct Velocity {
     pub x: f32,
     pub y: f32,
+    /// Counts seen too soon after a sample, folded into the next one.
+    pub pending_x: i32,
+    pub pending_y: i32,
 }
 
 impl Velocity {
     pub fn update(&mut self, dx: i32, dy: i32, dt: f32) {
         let dt = dt.clamp(0.001, 0.1);
+        let (dx, dy) = (dx + self.pending_x, dy + self.pending_y);
+        self.pending_x = 0;
+        self.pending_y = 0;
         let a = 1.0 - (-dt / SMOOTHING).exp();
         self.x += a * (dx as f32 / dt - self.x);
         self.y += a * (dy as f32 / dt - self.y);
@@ -131,13 +141,21 @@ pub(crate) fn apply(pad: &mut super::gameinput::PadState) {
     // The cursor goes back to the centre whether it moved or not: a move of
     // zero keeps it pinned there.
     unsafe { SetCursorPos(c.x, c.y) };
+    // The stick is held between samples: the pad's polls within one frame
+    // must all see the same deflection, not a re-decayed one.
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let mut velocity = g.take().unwrap_or_default();
     let now = Instant::now();
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    let dt = last.map(|l| now.duration_since(l).as_secs_f32()).unwrap_or(0.016);
-    *last = Some(now);
-    velocity.update(dx, dy, dt);
+    let since = last.map(|l| now.duration_since(l)).unwrap_or_default();
+    if since.as_millis() as u64 >= SAMPLE_MIN_MS {
+        *last = Some(now);
+        velocity.update(dx, dy, since.as_secs_f32().max(0.004));
+    } else {
+        // Too soon: keep the counts for the next sample instead.
+        velocity.pending_x += dx;
+        velocity.pending_y += dy;
+    }
     *g = Some(velocity);
     if !FEEDING.swap(dx != 0 || dy != 0, Ordering::Relaxed) && (dx != 0 || dy != 0) {
         tracing::info!("the mouse feeds the stick now (dx={dx}, dy={dy})");
@@ -168,7 +186,7 @@ mod tests {
     #[test]
     fn a_still_mouse_rests_the_stick() {
         assert_eq!(stick_from_mouse(0.0, 0.0), (0.0, 0.0));
-        assert_eq!(stick_from_mouse(10.0, 0.0), (0.0, 0.0));
+        assert_eq!(stick_from_mouse(4.0, 0.0), (0.0, 0.0));
     }
 
     #[test]
@@ -194,5 +212,14 @@ mod tests {
             v.update(0, 0, 0.016);
         }
         assert!(v.x < fast * 0.01, "{} -> {}", fast, v.x);
+    }
+
+    #[test]
+    fn counts_seen_between_samples_are_kept() {
+        let mut v = Velocity::default();
+        v.pending_x = 90;
+        v.update(10, 0, 0.008);
+        assert_eq!(v.pending_x, 0);
+        assert!(v.x > 5000.0, "{}", v.x);
     }
 }

@@ -3707,6 +3707,8 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        crate::capture::note_args(kind, arguments);
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
