@@ -22,6 +22,7 @@
 //! 18e57db8 found the same).
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -57,6 +58,9 @@ pub(crate) struct Pending {
     queued_at: OnceLock<Instant>,
     drops: AtomicU64,
     followed: AtomicBool,
+    /// (esat586 f8a76b1e, trustno1 77e13a97) How long draws have waited for
+    /// it so far over all frames, in microseconds ([`wait_once`]).
+    waited_us: AtomicU64,
     /// (fxceless a35c557) The formats its state declares for what a draw draws into
     /// (zeros without a graphics state), and the same shaders and state for other formats
     /// bound at a draw ([`for_formats`]): a chain, one link per set of formats met.
@@ -163,6 +167,7 @@ impl Pending {
             queued_at: OnceLock::new(),
             drops: AtomicU64::new(0),
             followed: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
             variant: OnceLock::new(),
             screen,
@@ -204,10 +209,29 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
+        self.make_with(|| {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            made
+        });
+    }
+
+    /// (fxceless #1353) Completes this queue entry with what `build` makes,
+    /// and wakes its waiters. A build that panics (translator or driver
+    /// wrapper) completes it too, without a host pipeline: the panic is
+    /// caught inside the initialisation, so the entry is final on whichever
+    /// thread made it (a worker, or a title thread through [`now`] or with
+    /// no workers), never left "being made" nor taken down with that thread.
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
+        self.made.get_or_init(|| {
+            let made = match catch_unwind(AssertUnwindSafe(build)) {
+                Ok(made) => made,
+                Err(_) => {
+                    tracing::error!(shaders = ?self.shaders, "a host pipeline's creation panicked: it goes without one");
+                    None
+                }
+            };
             // (Fox P) A creation that fails is final: `made` holds `None`
             // (the reason was logged by `HostPipeline::new`), never "being made".
             if made.is_none() {
@@ -401,6 +425,20 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// (esat586 f8a76b1e; trustno1 77e13a97, the problem of fxceless issue
+/// #1181) Whether one pipeline is waited for at most one budget over the
+/// whole run, not one budget every frame. A pipeline whose make takes longer
+/// than the budget (a driver compile of tens of seconds, or one that never
+/// ends) otherwise cost the whole budget in every frame in which a draw asked
+/// for it: the picture stood still while the thing drawn with it was in view.
+/// After its budget its draws are dropped until it is made, as with any
+/// pipeline past the frame's budget. On by default;
+/// `VICTORY_PIPELINE_WAIT_ONCE=0` waits as before.
+fn wait_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_none_or(|v| v != "0"))
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
@@ -408,6 +446,22 @@ fn wait(p: &Pending, frame: u64) {
     if budget.is_zero() {
         return;
     }
+    wait_with(p, frame, screen, budget, wait_once());
+}
+
+/// As [`wait`], with the budget and the per-pipeline cap given.
+fn wait_with(p: &Pending, frame: u64, screen: bool, budget: Duration, once: bool) {
+    // What is left of this pipeline's own budget ([`wait_once`]); one that
+    // has spent it takes nothing of the frame's.
+    let own = if once {
+        let own = budget.saturating_sub(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)));
+        if own.is_zero() {
+            return;
+        }
+        own
+    } else {
+        Duration::MAX
+    };
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
     static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
@@ -418,7 +472,7 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let left = budget.saturating_sub(spent.1).min(own);
         if shared {
             spent.1 += left;
         }
@@ -439,6 +493,16 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    if once && p.made.get().is_none() {
+        let before = p.waited_us.fetch_add(waited.as_micros().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
+        if Duration::from_micros(before) < budget && Duration::from_micros(before) + waited >= budget {
+            tracing::info!(
+                shaders = ?p.shaders,
+                ms = budget.as_millis() as u64,
+                "a pipeline not made within its wait: its draws are dropped until it is (VICTORY_PIPELINE_WAIT_ONCE=0: waited for every frame)"
+            );
+        }
+    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
@@ -657,19 +721,10 @@ fn workers() -> bool {
                     loop {
                         let p = next(screens_only);
                         BUSY.fetch_add(1, Ordering::Relaxed);
-                        // (Fox P) A creation that panics (translator or
-                        // driver wrapper) would end this worker and leave the
-                        // pipeline "being made" for good: it is made final
-                        // without a host pipeline instead, and said once.
-                        let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.make()));
-                        if made.is_err() {
-                            FAILED.fetch_add(1, Ordering::Relaxed);
-                            tracing::error!(shaders = ?p.shaders, "a host pipeline's creation panicked: it goes without one");
-                            let _ = p.made.set(None);
-                            let (lock, done) = &DONE;
-                            let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-                            done.notify_all();
-                        }
+                        // (Fox P, fxceless #1353) A creation that panics is
+                        // made final without a host pipeline inside `make`,
+                        // so this worker goes on to the next.
+                        p.make();
                         BUSY.fetch_sub(1, Ordering::Relaxed);
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
@@ -913,6 +968,46 @@ mod tests {
             Some("billboard_nobump:CS_RaytracingResolve_a56bfb9c")
         );
         assert_eq!(program_name(b"nothing here"), None);
+    }
+
+    #[test]
+    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
+        let bad = Arc::new(Pending::new(Vec::new(), None));
+        let good = Arc::new(Pending::new(Vec::new(), None));
+        let failed = bad.clone();
+        let next = good.clone();
+        let worker = std::thread::spawn(move || {
+            failed.make_with(|| panic!("synthetic pipeline build panic"));
+            next.make_with(|| None);
+        });
+
+        worker.join().expect("the pipeline worker should survive");
+        assert!(matches!(bad.made.get(), Some(None)));
+        assert!(matches!(good.made.get(), Some(None)));
+
+        bad.make_with(|| panic!("the refused pipeline should stay complete"));
+    }
+
+    /// (esat586 f8a76b1e) A slow pipeline costs one budget in total, and
+    /// leaves the next frame's budget to the others.
+    #[test]
+    fn pipeline_wait_caps_total_wait_per_pipeline_across_frames() {
+        let slow = Pending::new(Vec::new(), None);
+        let fresh = Pending::new(Vec::new(), None);
+        let budget = Duration::from_millis(20);
+        // Frames far from any the other tests use (the budget is per frame).
+        let frame = u64::MAX / 2;
+
+        wait_with(&slow, frame, false, budget, true);
+        assert!(Duration::from_micros(slow.waited_us.load(Ordering::Relaxed)) >= budget);
+
+        let started = Instant::now();
+        wait_with(&slow, frame + 1, false, budget, true);
+        assert!(started.elapsed() < Duration::from_millis(10));
+
+        let started = Instant::now();
+        wait_with(&fresh, frame + 1, false, budget, true);
+        assert!(started.elapsed() >= Duration::from_millis(15));
     }
 
     #[test]
