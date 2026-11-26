@@ -157,14 +157,36 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 /// all lanes) the lanes past the count stay and are left out of memory, EXEC's
 /// ballots and the wave's reductions instead (`Lower::partial_active`).
 fn counted_in_threads(parts: &Parts) -> bool {
-    let crate::native::StageIo::Cs(cs) = &parts.native.io else {
+    counted_in_threads_of(parts.native, parts.p)
+}
+
+/// [`counted_in_threads`] of `native`, built as `p`.
+fn counted_in_threads_of(native: &NativeProgram, p: &Program) -> bool {
+    let crate::native::StageIo::Cs(cs) = &native.io else {
         return false;
     };
     cs.threads[0] > 1
         && cs.threads[1..] == [1, 1]
-        && crate::spill::is_spilled(parts.native)
-        && (!parts.native.wave64 || host_max_wave() >= 64 || counted_halves())
-        && !parts.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier")
+        && crate::spill::is_spilled(native)
+        && (!native.wave64 || host_max_wave() >= 64 || counted_halves())
+        && !p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier")
+}
+
+/// (kyles98 4e825fbf) Whether a program's lanes start in EXEC only below the dispatch's
+/// thread count (`structure::set_entry_limited`; `VICTORY_THREAD_LIMIT=0`: every lane, as
+/// before): the compute programs with a spilled user-data table (the console's ray-tracing
+/// structure builder, whose in-place stages are dispatched by thread counts) whose lanes past
+/// the count are not already left out at entry ([`counted_in_threads`]): a console wave64
+/// program in two host waves of 32 (without `VICTORY_BVH_COUNT32=1`), one with a group
+/// barrier, or one with groups along y or z. A lane past the count is in the wave and
+/// outside EXEC, so a count of EXEC's lanes leaves it out, its stores do not happen, and a
+/// program that widens EXEC runs it as the console does.
+pub(super) fn thread_limited(native: &NativeProgram, p: &Program) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_LIMIT").is_none_or(|v| v != "0"))
+        && native.stage == HwStage::Cs
+        && crate::spill::is_spilled(native)
+        && !counted_in_threads_of(native, p)
 }
 
 /// (Fox T, upstream 06fe22a / PR #66) `VICTORY_BVH_COUNT32=1`: a wave64 program of the
@@ -547,6 +569,11 @@ struct Lower<'a> {
     /// The paired form: whether the last LDS access of the IR block being lowered wrote (none
     /// at its start), for the fences between accesses ([`Self::paired_inst`]).
     lds_last: Option<bool>,
+    /// With `split_lds`: whether the LDS reads from here on in the IR block being lowered see
+    /// the same writes as the last one, which met the other host wave before it (a group
+    /// barrier that waits). A run of reads then shares that barrier; it is local to the
+    /// block (a predecessor may have written LDS or taken another way in).
+    lds_reads_ordered: bool,
     /// The paired form: scalars each lane has its own of (a waterfall loop's first-lane reads
     /// and what is computed from them), on which no branch takes both lanes of a thread.
     lane_scalars: HashSet<Value>,
@@ -1374,6 +1401,23 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Where a program's constant table starts in its code: where its
+/// instructions end, unless a load at a fixed offset reads below that (then
+/// at `lowest`, the lowest offset any load or descriptor names). The
+/// program's constants follow its instructions, and a load at a computed
+/// offset reads them, not instruction bytes.
+fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Address], lowest: u32) -> u32 {
+    let code_end = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .map(|i| i.machine.offset + 4 * i.machine.words.len())
+        .max()
+        .unwrap_or(0) as u32;
+    let fixed_below = addresses.iter().any(|a| a.dynamic.is_none() && a.offset < code_end);
+    if fixed_below { lowest } else { lowest.max(code_end & !3) }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -1398,7 +1442,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
-        // LDS accesses get a group barrier each (a console wave split in two host waves)
+        // LDS accesses need group barriers where a console wave is split in two host waves.
         let mut split_lds = false;
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
         // where the host waves meet around those branches (`lds_meetings`)
@@ -1766,6 +1810,7 @@ impl<'a> Lower<'a> {
             twin: paired.then(Box::default),
             upper: false,
             lds_last: None,
+            lds_reads_ordered: false,
             lane_scalars: if paired { lane_scalars(p, x.res) } else { HashSet::new() },
             drop_in,
             drop_out,
@@ -1831,22 +1876,22 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<&crate::resource::Address> = self
                     .x
                     .res
                     .scalar
                     .iter()
-                    .map(|s| s.1)
+                    .map(|s| &s.1)
                     .chain(self.x.res.descriptors.iter().flat_map(|d| {
                         d.source.leaves().into_iter().filter_map(|l| match l {
-                            Source::Built { address, .. } => Some(*address),
+                            Source::Built { address, .. } => Some(address),
                             _ => None,
                         })
                     }))
                     .filter(|a| a.param == CODE)
-                    .map(|a| a.offset & !3)
-                    .min()
-                    .ok_or("a code table")?;
+                    .collect();
+                let lowest = addresses.iter().map(|a| a.offset & !3).min().ok_or("a code table")?;
+                let first = code_table_start(self.x.p, &addresses, lowest);
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -2530,6 +2575,33 @@ impl<'a> Lower<'a> {
             self.swap_lanes();
             r?;
         }
+        if crate::structure::entry_limited()
+            && let StageIo::Cs(cs) = &self.x.native.io
+            && let Some(&(_, lo)) = p.inputs.iter().find(|i| i.0 == Reg::S(EXEC))
+        {
+            // EXEC on entry, a lane's own bit: its thread along x is below the count the
+            // dispatch runs (`shader.rs` `USER_DISPATCH_THREADS_X`, 0: every thread).
+            if self.twin.is_some() {
+                return Err(unsupported(0, "a dispatch's thread count in the paired form"));
+            }
+            let e = self.s.entry;
+            let width = cs.threads[0];
+            let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+                unreachable!()
+            };
+            let Val::I32(thread) = self.thread_id(0) else {
+                return Err(unsupported(0, "a thread id for the dispatch's thread count"));
+            };
+            let size = self.s.m.i32(width);
+            let first = self.s.m.bin(e, Bin::Mul, group, size);
+            let at = self.s.m.bin(e, Bin::Add, first, thread);
+            let limit = self.host_word(RootType::Other(super::shader::USER_DISPATCH_THREADS_X), 0, width);
+            let zero = self.s.m.i32(0);
+            let all = self.s.m.cmp(e, pred::EQ, limit, zero);
+            let inside = self.s.m.cmp(e, pred::IULT, at, limit);
+            let bit = self.s.m.bin(e, Bin::Or, all, inside);
+            self.lane_bits.insert(lo, bit);
+        }
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -2550,8 +2622,10 @@ impl<'a> Lower<'a> {
                 self.block_phis(b);
                 self.swap_lanes();
             }
+            self.lds_reads_ordered = false;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
+                self.lds_reads_ordered = super::group_sync() != 0;
             }
             self.lds_last = None;
             let mut i = 0;
@@ -2569,6 +2643,7 @@ impl<'a> Lower<'a> {
                             self.section_inst(b, j, i);
                         }
                     }
+                    self.lds_reads_ordered = false;
                     i = end;
                     continue;
                 }
@@ -5760,10 +5835,17 @@ impl<'a> Lower<'a> {
             && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
         {
             // the two host waves of a console wave meet before each LDS access: what the other
-            // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            // half wrote is visible, and what it still reads is not overwritten. All reads in
+            // a run see the same writes, so they share one meeting; the one before a write or
+            // atomic still waits for every read before it.
+            let read = matches!(&inst.fields, Fields::Ds { gds: false, data, .. }
+                if data.is_empty() && name.starts_with("ds_read"));
+            if !read || !self.lds_reads_ordered {
+                self.lds_meeting();
+            }
+            self.lds_reads_ordered = read && super::group_sync() != 0;
+        } else if name != "s_nop" && !name.starts_with("s_waitcnt") {
+            self.lds_reads_ordered = false;
         }
         // The structure builder's threads take turns through atomics (a tree
         // built from its leaves up): what one wrote before its atomic is
@@ -5794,6 +5876,7 @@ impl<'a> Lower<'a> {
                 if !waits {
                     mode &= !1;
                 }
+                self.lds_reads_ordered = self.split_lds && waits;
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s
@@ -5828,6 +5911,7 @@ impl<'a> Lower<'a> {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
+                self.lds_reads_ordered = false;
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }
@@ -13361,13 +13445,34 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// A program's constant table starts after its instructions, unless a
+    /// load at a fixed offset reads below that.
+    #[test]
+    fn the_code_table_starts_after_the_instructions() {
+        // s_nop 0, s_endpgm, then 1,000 dwords of constants.
+        let mut words = vec![0xBF80_0000, S_ENDPGM];
+        words.extend(0..1000u32);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let at = |offset: u32, dynamic: bool| resource::Address {
+            param: resource::CODE,
+            offset,
+            dynamic: dynamic.then_some(ir::Value(0)),
+        };
+        let (computed, fixed_after, fixed_inside) = (at(0, true), at(12, false), at(4, false));
+        assert_eq!(code_table_start(&p, &[&computed], 0), 8);
+        assert_eq!(code_table_start(&p, &[&computed, &fixed_after], 0), 8);
+        assert_eq!(code_table_start(&p, &[&computed, &fixed_inside], 0), 0);
+        assert_eq!(code_table_start(&p, &[&fixed_after], 12), 12);
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {

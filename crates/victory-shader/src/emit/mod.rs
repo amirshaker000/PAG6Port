@@ -494,13 +494,27 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
     let p = crate::spill::build(&native)?;
-    // Structurisation first: tracing per-lane descriptors needs it (its
-    // failure is reported after the earlier stages').
-    let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
-    let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    // (kyles98 4e825fbf) The lanes past a dispatch's thread count start outside EXEC
+    // (`lower::thread_limited`); where that does not translate, every lane runs as before.
+    let limited = lower::thread_limited(&native, &p);
+    let attempt = |limited: bool| {
+        let was = structure::set_entry_limited(limited);
+        let r = (|| {
+            // Structurisation first: tracing per-lane descriptors needs it (its
+            // failure is reported after the earlier stages').
+            let st = structure::structure(&p);
+            let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+            let io = io::raise(&p, &native)?;
+            let st = st?;
+            emit(&c, &native, &p, &st, &io, &res)
+        })();
+        structure::set_entry_limited(was);
+        r
+    };
+    match attempt(limited) {
+        Err(_) if limited => attempt(false),
+        r => r,
+    }
 }
 
 /// Emits a program whose earlier stages already ran.

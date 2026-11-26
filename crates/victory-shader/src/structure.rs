@@ -455,6 +455,27 @@ impl Structured {
     }
 }
 
+thread_local! {
+    static ENTRY_LIMITED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the program structured on this thread starts with a wave whose last lanes may be
+/// outside EXEC (see [`set_entry_limited`]).
+pub fn entry_limited() -> bool {
+    ENTRY_LIMITED.get()
+}
+
+/// For the programs structured on this thread from here on: whether EXEC on entry is each
+/// lane's own bit, not every lane. The console can dispatch a compute program by thread
+/// counts (`DispatchX` with the card's "use thread dimensions" bit): the last group's wave
+/// then starts with only the lanes below the count in EXEC. The others are in the wave all
+/// the same (a program that widens EXEC to every lane runs them too, and a count of EXEC's
+/// lanes leaves them out), so the host runs the whole group and the translation gives each
+/// lane its bit (`emit::USER_DISPATCH_THREADS_X`). Returns the setting before.
+pub fn set_entry_limited(on: bool) -> bool {
+    ENTRY_LIMITED.replace(on)
+}
+
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     structure_wide(program, &HashSet::new())
@@ -647,7 +668,11 @@ impl<'a> Lanes<'a> {
             } else {
                 lo
             };
-            self.masks.insert((lo, hi), Bool::TRUE);
+            // Every lane, or, for a program that may be dispatched by thread counts
+            // (`entry_limited`), the lane's own bit: the lanes past the count are in the wave
+            // and outside EXEC.
+            let entry = if entry_limited() { self.b.atom(Atom::Lane(lo), 0) } else { Bool::TRUE };
+            self.masks.insert((lo, hi), entry);
             self.active.insert(lo);
         }
         let mut execs: Vec<Vec<Option<Bool>>> =
