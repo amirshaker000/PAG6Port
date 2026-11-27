@@ -1223,6 +1223,9 @@ const BATCHES: u32 = 8;
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    /// (Fox T, `VICTORY_PLANE_NOW`) Depth planes used before their pass since
+    /// the last draw, with their twins.
+    plane_late: Mutex<Vec<(std::sync::Arc<crate::resource::HostTexture>, std::sync::Arc<crate::resource::Twin>)>>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1540,6 +1543,15 @@ impl PlanePass {
             Ok((root, pipeline))
         }
     }
+}
+
+/// (Fox T, port of Op-lite/Yaekai 183ac80fe) `VICTORY_PLANE_NOW=1` (default off):
+/// a depth plane whose twin a list wrote is given the twin's contents before
+/// the draw or dispatch that next uses it, not when the list closes: such a
+/// use read the plane as it was (tiled lighting's class plane).
+pub(crate) fn plane_now() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLANE_NOW").is_some_and(|v| v == "1"))
 }
 
 /// Records into `list` the pass that draws `plane`, the twin of the depth
@@ -4173,6 +4185,7 @@ impl Host {
             Ok(HostList {
                 allocator,
                 list,
+                plane_late: Mutex::default(),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -6621,8 +6634,13 @@ impl HostList {
         // the plane as it was; the pass runs when the list closes
         // (`twins_to_depth`). Counted.
         if copy && !colour && twin.plane.is_some() {
-            u.late = true;
             crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
+            self.plane_late.lock().unwrap_or_else(|e| e.into_inner()).push((depth.clone(), twin.clone()));
+            // (Fox T, `VICTORY_PLANE_NOW`) The pass is recorded before the
+            // draw that uses the plane (`crate::draw`), not when the list closes.
+            if !plane_now() {
+                u.late = true;
+            }
         }
         drop(twins);
         if copy {
@@ -6635,6 +6653,23 @@ impl HostList {
             self.settle(plane, UNORDERED_ACCESS);
         }
         true
+    }
+
+    /// (Fox T) The depth planes used before their pass since the last call.
+    pub(crate) fn take_plane_late(&self) -> Vec<(std::sync::Arc<crate::resource::HostTexture>, std::sync::Arc<crate::resource::Twin>)> {
+        let mut late = self.plane_late.lock().unwrap_or_else(|e| e.into_inner());
+        if late.is_empty() { Vec::new() } else { std::mem::take(&mut *late) }
+    }
+
+    /// (Fox T, `VICTORY_PLANE_NOW=1`) Records now the pass that draws each
+    /// plane's twin into the plane (`pass_plane`), which before ran when the
+    /// list closed: the caller sets the title's state on the list again
+    /// (`crate::draw::State::replay`) and binds anew before its draw.
+    pub(crate) fn planes_now(&self, late: &[(std::sync::Arc<crate::resource::HostTexture>, std::sync::Arc<crate::resource::Twin>)]) {
+        for (depth, twin) in late {
+            self.pass_plane(depth, twin);
+        }
+        self.changed_something();
     }
 
     /// Records the pass that draws the twin of the depth plane of `depth`
