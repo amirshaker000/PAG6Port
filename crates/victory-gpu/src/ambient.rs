@@ -139,6 +139,36 @@ fn shade() -> [f32; 2] {
     })
 }
 
+/// The programs' text, by `VICTORY_AMBIENT_LEFTOVER`: what the raise does with what the title's program left
+/// in the image.
+/// - unset: kept as far as it can be true, and only where its colour can be the light's here. Memory the
+///   program never wrote is of other hues: magenta and violet patches (what Yaekai/victory-scarlett-3070's
+///   "leftover=off" was for, at the price of the title's own light).
+/// - `0`: not kept, only the estimate (the 3070 fork's line).
+/// - `1`: kept by its brightness alone.
+fn source() -> String {
+    const HUE: &str = "    float3 hue_was = was / max(dot(was, LUMA), 1e-6);\n    float3 hue_now = found / max(dot(found, LUMA), 1e-6);\n    was *= saturate((2.0 - length(hue_was - hue_now)) / 0.8);\n";
+    let text = match std::env::var("VICTORY_AMBIENT_LEFTOVER").as_deref().map(str::trim) {
+        Ok("0") => SOURCE.replace(HUE, "").replace("float3 was = unpack(light[p]);", "float3 was = float3(0.0, 0.0, 0.0);"),
+        Ok("1") => SOURCE.replace(HUE, ""),
+        _ => SOURCE.to_owned(),
+    };
+    format!("#define FLOOR {}\n{text}", floor())
+}
+
+/// (Local) `VICTORY_AMBIENT_FLOOR=<level>` (unset or 0: none): the least the estimate of the indirect light is,
+/// in the image's own units, shaded in creases as the estimate is.
+///
+/// The estimate is made of the light the visible surfaces send out. In a room with the lamps off, in deep
+/// shade and at night there is next to none of it on the screen, and the picture is black where the
+/// console's traced light would have a little from the sky and from lamps out of sight.
+fn floor() -> f32 {
+    static LEVEL: OnceLock<f32> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("VICTORY_AMBIENT_FLOOR").ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+    })
+}
+
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
@@ -335,12 +365,16 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    found = max(found, float3(1.0, 0.98, 0.94) * FLOOR * open);
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
+    float3 hue_was = was / max(dot(was, LUMA), 1e-6);
+    float3 hue_now = found / max(dot(found, LUMA), 1e-6);
+    was *= saturate((2.0 - length(hue_was - hue_now)) / 0.8);
     light[p] = pack(max(was, found));
 }
 #endif
@@ -370,7 +404,7 @@ unsafe impl Sync for Pass {}
 fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        let code = crate::host::compile(&format!("#define {part}\n{}", source()), entry, s!("cs_5_1"))?;
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
             if root.is_none() {
