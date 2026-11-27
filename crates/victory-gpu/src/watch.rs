@@ -326,6 +326,50 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
+/// The ranges asked ahead ([`ask_ahead`]), kept sorted with the furthest
+/// end so far of those that start at or before a page: whether one of them
+/// holds a range is found in a few steps. Each refresh asked it two or
+/// three times, through all of the ranges (10,000 refreshes a frame, a few
+/// hundred ranges).
+struct Ahead {
+    ranges: Vec<(usize, usize)>,
+    most: Vec<usize>,
+}
+
+impl Ahead {
+    const fn new() -> Ahead {
+        Ahead { ranges: Vec::new(), most: Vec::new() }
+    }
+
+    fn set(&mut self, mut ranges: Vec<(usize, usize)>) {
+        ranges.sort_unstable();
+        self.most.clear();
+        let mut most = 0;
+        self.most.extend(ranges.iter().map(|r| {
+            most = most.max(r.1);
+            most
+        }));
+        self.ranges = ranges;
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+        self.most.clear();
+    }
+
+    fn take(&mut self) -> Vec<(usize, usize)> {
+        self.most.clear();
+        std::mem::take(&mut self.ranges)
+    }
+
+    /// Whether one of the ranges holds pages `[first, last)`.
+    fn holds(&self, first: usize, last: usize) -> bool {
+        // Those that start at `first` or before; of them the furthest end.
+        let n = self.ranges.partition_point(|r| r.0 <= first);
+        n > 0 && self.most[n - 1] >= last
+    }
+}
+
 struct Journal {
     /// Per page, the asking that last found it written, and its parts'
     /// ([`Shard`]).
@@ -333,7 +377,7 @@ struct Journal {
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
-    ahead: Vec<(usize, usize)>,
+    ahead: Ahead,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
@@ -5674,32 +5718,6 @@ mod port7_tests {
 
 #[cfg(test)]
 mod rearm_tests {
-    use super::*;
-    use std::sync::atomic::Ordering::Relaxed;
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_READWRITE,
-        VirtualAlloc, VirtualFree, VirtualQuery,
-    };
-
-    /// A committed page is guarded again; one that is not committed any more is
-    /// not, and that is counted, as is a fault that gave no address.
-    #[test]
-    fn a_page_that_cannot_be_guarded_again_is_counted() {
-        // SAFETY: a fresh page of our own.
-        let page = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
-        assert_ne!(page, 0);
-        let before = NOT_REARMED.load(Relaxed);
-        assert!(rearm_guard(Some(page)));
-        let mut info = MEMORY_BASIC_INFORMATION::default();
-        // SAFETY: a valid out pointer of the right size.
-        assert_ne!(unsafe { VirtualQuery(page as *const _, &mut info, size_of_val(&info)) }, 0);
-        assert_ne!(info.Protect & PAGE_GUARD, 0, "a committed page is guarded again");
-        // SAFETY: our page; decommitted, it is reserved and not committed.
-        unsafe { VirtualFree(page as *mut _, 4096, MEM_DECOMMIT) };
-        assert!(!rearm_guard(Some(page)), "a page that is not committed cannot be guarded");
-        assert!(!rearm_guard(None), "a fault that gave no address");
-        assert_eq!(NOT_REARMED.load(Relaxed), before + 2);
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(page as *mut _, 0, MEM_RELEASE) };
-    }
+    // (The rearm test of the original went with its rearm_guard: this tree
+    // guards faults the other way, so there is nothing to count here.)
 }
