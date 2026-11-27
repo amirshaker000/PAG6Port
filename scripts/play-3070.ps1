@@ -21,7 +21,7 @@ $set = [ordered]@{
     VICTORY_AMBIENT_AIR = '1.5'; VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'
     VICTORY_CARD_REHASH_RUNS = '1'; VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'
     VICTORY_CARD_STEPS = '2'; VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_CARD_AWAKE = '1'
-    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_THIN = '0'; VICTORY_JOIN_PARTS = '8'
+    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'
     VICTORY_UPLOAD_AHEAD = '1'; VICTORY_CARD_BUFFERS_MIN_KB = '64'; VICTORY_LEVELS_ON_DEMAND = '0'
     VICTORY_WAVE64_PAIRED = '1'; VICTORY_F16_NEAREST = '1'; VICTORY_CARD_BUFFERS_MB = '1024'
     VICTORY_WINDOWS_BAR_MB = '512'; VICTORY_E5_TARGETS = 'r11g11b10'; VICTORY_THIN_THREADS = '6'
@@ -41,13 +41,17 @@ $set = [ordered]@{
     # render-target VRAM reserve released once the scene settles
     VICTORY_HEAP_SYNC_FIRST = '1'; VICTORY_SYNC_IN_PLACE = '1'; VICTORY_SPANS_QUICK = '1'; VICTORY_SYNC_FINE = '1'
     # Belobug renderer ports 6+7 (POLSKAGUROM on RTX 5060 Ti: 13.5 -> 19.4 fps, CPU prep 41 -> 32 ms)
-    VICTORY_PORT_GUARD = '1'; VICTORY_PORT_JOURNAL = '1'
+    # off: on this RTX 3070 they corrupted textures (green faces, rainbow skin, blocky light) - A/B 2026-11-27
+    VICTORY_PORT_GUARD = '0'; VICTORY_PORT_JOURNAL = '0'
     VICTORY_WC_NO_BACK = '1'; VICTORY_WC_NO_BACK_MIN_KB = '1024'; VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS = '20000'
     # Ray tests answer empty (the builder is off): no violet/purple glow, about 10 ms a frame less (trustno1/megafork; = Yaekai PROBE_RAYS)
     VICTORY_BVH_MISS = '1'
+    # GLM survey 2026-11-27: Vice-Tay 4070 thread preset (14 -> ~20 fps there), bounded leftover probe light
+    # (trustno1, white glow), static-sampler pipelines kept out of the library (posterized look)
+    VICTORY_LAND_THREADS = '4'; VICTORY_PIPELINE_WORKERS = '3'; VICTORY_AMBIENT_MOST = '2'; VICTORY_LIBRARY_STATIC_SAMPLERS = '0'
     # Picture fixes: THIN off (megafork 79f36b3b: whiteout and blur on NVIDIA), depth planes current before use
     # (Scarlett/Yaekai PLANE_NOW: stale depth for lighting and depth of field), character bakes get time (eyes, faces)
-    VICTORY_PLANE_NOW = '1'; VICTORY_BAKE_TEXTURES_MS = '10000'
+    VICTORY_PLANE_NOW = '0'; VICTORY_BAKE_TEXTURES_MS = '10000'
     # Yaekai/victory-scarlett-3070: broken water/heat-haze and decal-defrag pipelines skipped; NVIDIA heap cap
     VICTORY_SKIP_PIPELINES = '02384a60fda6f2d0,731a39171b568298'; VICTORY_DYNAMIC_SLOTS = '524288'
     # 8 GB shared with desktop apps: the 1536/1024 MB reservations filled the card (7736 of 8192 MB, black screen)
