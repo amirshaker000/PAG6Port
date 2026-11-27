@@ -37,6 +37,12 @@ $set = [ordered]@{
     VICTORY_LOG = 'warn'
     # WASDeKeys memory caps (prelude recycling, staging idle cap): no 0x8007000E commit OOM
     VICTORY_MAX_PRELUDES = '32'; VICTORY_STAGING_KEPT = '4'
+    # Submit-thread CPU work (foxhound / Yaekai victory-scarlett-3070 b4ed67d89): descriptor sync bundle, no WC readbacks,
+    # render-target VRAM reserve released once the scene settles
+    VICTORY_HEAP_SYNC_FIRST = '1'; VICTORY_SYNC_IN_PLACE = '1'; VICTORY_SPANS_QUICK = '1'; VICTORY_SYNC_FINE = '1'
+    # Belobug renderer ports 6+7 (POLSKAGUROM on RTX 5060 Ti: 13.5 -> 19.4 fps, CPU prep 41 -> 32 ms)
+    VICTORY_PORT_GUARD = '1'; VICTORY_PORT_JOURNAL = '1'
+    VICTORY_WC_NO_BACK = '1'; VICTORY_WC_NO_BACK_MIN_KB = '1024'; VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS = '20000'
     # Ray tests answer empty (the builder is off): no violet/purple glow, about 10 ms a frame less (trustno1/megafork; = Yaekai PROBE_RAYS)
     # VICTORY_BVH_MISS = '1'  # translator switch: changes every pipeline fingerprint (full 1 h re-warm)
     # Yaekai/victory-scarlett-3070: broken water/heat-haze and decal-defrag pipelines skipped; NVIDIA heap cap
@@ -67,7 +73,7 @@ if (-not (Test-Path $mark)) {
 $wmark = "$cache\pipelines-warm-$((Get-Item $exe).LastWriteTime.Ticks).txt"
 if ((Test-Path "$cache\pipelines\known-pipelines.bin") -and -not (Test-Path $wmark)) {
     Write-Host 'Making every known pipeline ahead (once per build, can take up to an hour)...'
-    & $exe warm --jobs 8 2>&1 | Out-File "$logs\unified-warm-$stamp.log" -Encoding utf8
+    & $exe warm --used --jobs 8 2>&1 | Out-File "$logs\unified-warm-$stamp.log" -Encoding utf8
     'done' | Out-File $wmark
 }
 $log = "$logs\unified-$stamp.log"
