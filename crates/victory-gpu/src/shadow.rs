@@ -1576,18 +1576,19 @@ fn wide(jobs: Vec<Job>) {
     // meanwhile looks at the queue before it sleeps again, and this thread
     // takes what nobody took.
     let wake = (jobs.len() - 1).min(wide_threads());
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    let left = Arc::new(std::sync::atomic::AtomicUsize::new(jobs.len()));
+    let done = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
             let left = left.clone();
+            let done = done.clone();
             workers.there.fetch_add(1, Ordering::AcqRel);
             queue.push_back(Box::new(move || {
                 job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
+                if left.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    *done.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                    done.1.notify_all();
                 }
             }));
         }
@@ -1607,10 +1608,12 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
-    spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    spin(|| left.load(Ordering::Acquire) == 0);
+    if left.load(Ordering::Acquire) > 0 {
+        let mut finished = done.0.lock().unwrap_or_else(|e| e.into_inner());
+        while !*finished {
+            finished = done.1.wait(finished).unwrap_or_else(|e| e.into_inner());
+        }
     }
 }
 

@@ -676,6 +676,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         let j = journal();
         return Some((next_asking(), of(&j)));
     }
+    // View memory queried without guards (e.g. texture pass) would always be
+    // refused by GetWriteWatch; skip the failing kernel call immediately.
+    if !guarded && PROTECTED.any(first, last) {
+        return None;
+    }
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
     let _range = Asking::hold(first, last);
