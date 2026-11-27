@@ -161,7 +161,7 @@ fn interpose(name: &str, original: usize) -> Option<usize> {
         ffxQuery as *const () as usize,
         ffxDispatch as *const () as usize,
     ][i];
-    tracing::info!(name, original = format_args!("{original:#x}"), "FidelityFX: the title's import goes through ours (DLSS / frame generation)");
+    tracing::warn!(name, original = format_args!("{original:#x}"), "FidelityFX: the title's import goes through ours (DLSS / frame generation)");
     Some(ours)
 }
 
@@ -257,7 +257,9 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     let d = unsafe { desc.cast::<DispatchUpscale>().read() };
     first_dispatch(&d, &created);
     let up = upscale(&d, &created, handle);
-    match streamline::upscale(&up) {
+    let taken = streamline::upscale(&up);
+    tally(matches!(taken, Taken::Dlss));
+    match taken {
         Taken::Dlss => OK,
         Taken::Noted => own(),
         Taken::No(why) => {
@@ -265,6 +267,25 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
             refused(why);
             own()
         }
+    }
+}
+
+/// Proof in a warn-level log that DLSS really upscales: the first frame it
+/// takes, then every 900 upscale dispatches how many went to DLSS and how many
+/// to the title's own upscaler.
+fn tally(dlss: bool) {
+    static DLSS: AtomicUsize = AtomicUsize::new(0);
+    static OWN: AtomicUsize = AtomicUsize::new(0);
+    let (d, o) = if dlss {
+        (DLSS.fetch_add(1, Relaxed) + 1, OWN.load(Relaxed))
+    } else {
+        (DLSS.load(Relaxed), OWN.fetch_add(1, Relaxed) + 1)
+    };
+    if dlss && d == 1 {
+        tracing::warn!("DLSS: the first frame upscaled by DLSS");
+    }
+    if (d + o) % 900 == 0 {
+        tracing::warn!(dlss = d, own = o, "DLSS: upscale dispatches so far");
     }
 }
 
