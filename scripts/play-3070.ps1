@@ -1,8 +1,9 @@
 # Play-Unified: Keel62155/VIctoryUnified (cool_fox for 8 GB NVIDIA, measured 18-21 fps on an RTX 4060 8 GB),
 # fast build, its scripts\play-nvidia-8gb.cmd settings, our paths (all on E:), 1080p.
 #   .\Play-Unified.ps1            translate shaders once per build, then play
+#   .\Play-Unified.ps1 -FullWarm  make ALL known pipelines (~55 min) so new areas never stutter
 #   .\Play-Unified.ps1 -More @{ VICTORY_LOG = 'info' }
-param([hashtable]$More = @{})
+param([hashtable]$More = @{}, [switch]$FullWarm)
 $root  = 'E:\Game\GTA6.Xbox.v1.0.2.1-CYBERLEEK'
 $repo  = "$root\GTAVI-Repos\unified"
 $exe   = "$repo\target\fast\victory.exe"
@@ -78,9 +79,11 @@ if (-not (Test-Path $mark)) {
 # Full pipeline warm-up once per build: every pipeline in the book is made before playing,
 # so the game does not compile them mid-scene (first-session stutter and missing-shader look)
 $wmark = "$cache\pipelines-warm-$((Get-Item $exe).LastWriteTime.Ticks).txt"
+if ($FullWarm) { Remove-Item $wmark -ErrorAction SilentlyContinue }
 if ((Test-Path "$cache\pipelines\known-pipelines.bin") -and -not (Test-Path $wmark)) {
     Write-Host 'Making every known pipeline ahead (once per build, can take up to an hour)...'
-    & $exe warm --used --jobs 8 2>&1 | Out-File "$logs\unified-warm-$stamp.log" -Encoding utf8
+    $how = if ($FullWarm) { @('warm','--jobs','8') } else { @('warm','--used','--jobs','8') }
+    & $exe @how 2>&1 | Out-File "$logs\unified-warm-$stamp.log" -Encoding utf8
     'done' | Out-File $wmark
 }
 $log = "$logs\unified-$stamp.log"
