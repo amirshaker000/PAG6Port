@@ -19,7 +19,20 @@ use std::sync::atomic::{AtomicI64, AtomicIsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-pub(super) const FULL_SPEED: f32 = 1800.0;
+/// Mouse counts a second for a full stick deflection (lower = faster camera).
+/// `VICTORY_MOUSE_SPEED` overrides it; 1800 was too slow in play.
+pub(super) const FULL_SPEED: f32 = 600.0;
+
+fn full_speed() -> f32 {
+    static SPEED: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SPEED.get_or_init(|| {
+        std::env::var("VICTORY_MOUSE_SPEED")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(FULL_SPEED)
+    })
+}
 /// Slower than this (counts a second) the stick rests: sensor noise.
 const REST_SPEED: f32 = 8.0;
 /// Deflection the slowest movement starts at (past the inner dead zone).
@@ -37,7 +50,7 @@ pub(super) fn stick_from_mouse(vx: f32, vy: f32) -> (f32, f32) {
     if speed < REST_SPEED {
         return (0.0, 0.0);
     }
-    let m = (speed / FULL_SPEED).min(1.0);
+    let m = (speed / full_speed()).min(1.0);
     let out = START + (1.0 - START) * m;
     (vx / speed * out, -vy / speed * out)
 }
