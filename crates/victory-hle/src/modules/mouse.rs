@@ -105,6 +105,7 @@ unsafe extern "system" {
     fn GetCursorPos(point: *mut Point) -> i32;
     fn SetCursorPos(x: i32, y: i32) -> i32;
     fn GetForegroundWindow() -> *mut core::ffi::c_void;
+    fn SetCursor(cursor: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
 }
 
 pub(crate) fn enabled() -> bool {
@@ -143,8 +144,22 @@ pub(crate) fn attach(hwnd: *mut core::ffi::c_void) {
 
 /// The window procedure's messages: nothing needed any more, the stick is
 /// polled each frame; kept so the wiring holds.
-pub(crate) fn on_message(_hwnd: isize, _message: u32, _wparam: usize, _lparam: isize) -> bool {
-    false
+pub(crate) fn on_message(hwnd: isize, message: u32, _wparam: usize, lparam: isize) -> bool {
+    // WM_SETCURSOR over the client area while the title has the focus: no
+    // cursor, so the pinned pointer is not drawn in the middle of the picture.
+    const WM_SETCURSOR: u32 = 0x20;
+    const HTCLIENT: isize = 1;
+    if !enabled() || message != WM_SETCURSOR || (lparam & 0xFFFF) != HTCLIENT {
+        return false;
+    }
+    // SAFETY: plain queries; a null cursor hides the pointer.
+    unsafe {
+        if GetForegroundWindow() as isize != hwnd {
+            return false;
+        }
+        SetCursor(core::ptr::null_mut());
+    }
+    true
 }
 
 /// The mouse's right stick for this frame, on top of `pad`'s own while it
